@@ -36,6 +36,8 @@ final class YtDlpDownloader implements MediaDownloaderInterface
         // 2. Обработка карусели слайдов
         if ($isPhoto) {
             $imgPattern = "{$tempDir}/slide_%(autonumber)02d.%(ext)s";
+            
+            // Скачиваем превью/слайды
             $cmd = sprintf(
                 'yt-dlp --no-warnings --socket-timeout %d --write-all-thumbnails --skip-download -o %s %s 2>&1',
                 $this->socketTimeout,
@@ -46,6 +48,7 @@ final class YtDlpDownloader implements MediaDownloaderInterface
 
             $files = scandir($tempDir) ?: [];
             $images = [];
+            $seenHashes = [];
 
             foreach ($files as $file) {
                 if ($file === '.' || $file === '..') {
@@ -53,8 +56,18 @@ final class YtDlpDownloader implements MediaDownloaderInterface
                 }
                 $path = "{$tempDir}/{$file}";
                 $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+
                 if (in_array($ext, ['jpg', 'jpeg', 'png', 'webp'], true) && filesize($path) > 10000) {
-                    $images[] = $path;
+                    // Считаем хеш содержимого файла для исключения визуальных копий
+                    $hash = md5_file($path);
+
+                    if ($hash !== false && !isset($seenHashes[$hash])) {
+                        $seenHashes[$hash] = true;
+                        $images[] = $path;
+                    } else {
+                        // Удаляем дубль сразу с диска
+                        @unlink($path);
+                    }
                 }
             }
             sort($images);
