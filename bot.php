@@ -24,7 +24,7 @@ $client = new Client([
 ]);
 
 $offset = 0;
-echo "Бот запущен (карусель всех фото + видео)...\n";
+echo "Бот запущен с поддержкой полного плейлиста слайдов...\n";
 
 while (true) {
     try {
@@ -100,131 +100,91 @@ while (true) {
                     $tempDir = sys_get_temp_dir() . '/' . uniqid('tt_');
                     @mkdir($tempDir, 0777, true);
 
-                    // 1. ПРОВЕРКА И ИЗВЛЕЧЕНИЕ КАРУСЕЛИ
+                    // 1. ЕСЛИ ЭТО ФОТОПОСТ (или ссылка /photo/)
                     if ($mediaType === 'photo' || str_contains($tiktokUrl, '/photo/')) {
-                        echo "Сбор слайдов карусели...\n";
+                        echo "Скачивание всех слайдов карусели через плейлист yt-dlp...\n";
 
-                        // Вытаскиваем полный JSON
-                        $dumpCmd = sprintf(
-                            'yt-dlp -J --no-warnings --socket-timeout 20 %s 2>&1',
+                        // Выкачиваем все слайды плейлиста как файлы изображений
+                        $outPattern = "{$tempDir}/slide_%(playlist_index|autonumber)02d.%(ext)s";
+                        $cmd = sprintf(
+                            'yt-dlp --yes-playlist --no-warnings -o %s %s 2>&1',
+                            escapeshellarg($outPattern),
                             escapeshellarg($targetUrl)
                         );
-                        $jsonRaw = shell_exec($dumpCmd);
-                        $meta = json_decode($jsonRaw, true);
+                        exec($cmd, $out, $code);
 
-                        $slideMap = [];
+                        // Читаем все скачанные файлы
+                        $allFiles = scandir($tempDir) ?: [];
+                        $validImages = [];
 
-                        // Вариант А: Проверяем entries (если yt-dlp распознал как multi-item)
-                        if (!empty($meta['entries']) && is_array($meta['entries'])) {
-                            foreach ($meta['entries'] as $idx => $entry) {
-                                if (!empty($entry['url'])) {
-                                    $slideMap[$idx] = $entry['url'];
-                                } elseif (!empty($entry['thumbnails'])) {
-                                    $best = end($entry['thumbnails']);
-                                    if (!empty($best['url'])) {
-                                        $slideMap[$idx] = $best['url'];
-                                    }
+                        foreach ($allFiles as $f) {
+                            if ($f === '.' || $f === '..') continue;
+                            $fullPath = "{$tempDir}/{$f}";
+                            $ext = strtolower(pathinfo($fullPath, PATHINFO_EXTENSION));
+
+                            // Берем только реальные графические файлы
+                            if (in_array($ext, ['jpg', 'jpeg', 'png', 'webp'])) {
+                                if (filesize($fullPath) > 5000) {
+                                    $validImages[] = $fullPath;
                                 }
                             }
                         }
 
-                        // Вариант Б: Проверяем thumbnails (где лежат слайды поста)
-                        if (empty($slideMap) && !empty($meta['thumbnails']) && is_array($meta['thumbnails'])) {
-                            foreach ($meta['thumbnails'] as $t) {
-                                if (empty($t['url']) || str_contains($t['url'], 'avatar')) {
-                                    continue;
-                                }
+                        // Сортируем строго по именам (slide_01, slide_02, slide_03, slide_04...)
+                        sort($validImages);
 
-                                $tid = $t['id'] ?? '';
-                                // В TikTok слайды имеют ID вида: image_0, image_1, 0, 1 или группируются по индексу
-                                if (preg_match('/(?:image_|^)(\d+)/', $tid, $m)) {
-                                    $idx = (int)$m[1];
-                                    // Сохраняем (каждая последующая запись с тем же индексом обычно большего разрешения)
-                                    $slideMap[$idx] = $t['url'];
-                                } else {
-                                    // Если явного ID нет, группируем по уникальному пути URL (без query params)
-                                    $cleanImgPath = strtok($t['url'], '?');
-                                    $slideMap[$cleanImgPath] = $t['url'];
-                                }
-                            }
-                        }
+                        if (!empty($validImages)) {
+                            echo "Успешно скачано слайдов: " . count($validImages) . ". Отправка в TG...\n";
 
-                        $slideUrls = array_values($slideMap);
-
-                        if (!empty($slideUrls)) {
-                            echo "Найдено " . count($slideUrls) . " слайдов. Начинаю скачивание...\n";
-
-                            $downloadedFiles = [];
-                            foreach (array_slice($slideUrls, 0, 10) as $i => $imgUrl) {
-                                $filePath = "{$tempDir}/slide_{$i}.jpg";
-                                try {
-                                    $client->get($imgUrl, [
-                                        'sink'    => $filePath,
-                                        'timeout' => 15,
-                                        'headers' => [
-                                            'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                                            'Referer'    => 'https://www.tiktok.com/',
-                                        ],
-                                    ]);
-                                    if (file_exists($filePath) && filesize($filePath) > 3000) {
-                                        $downloadedFiles[] = $filePath;
-                                    }
-                                } catch (\Throwable $e) {}
-                            }
-
-                            if (!empty($downloadedFiles)) {
-                                if (count($downloadedFiles) === 1) {
-                                    echo "Отправка одиночного фото...\n";
-                                    $client->post($telegramApiUrl . 'sendPhoto', [
-                                        'multipart' => [
-                                            ['name' => 'chat_id', 'contents' => (string)$chatId],
-                                            ['name' => 'photo',   'contents' => fopen($downloadedFiles[0], 'r'), 'filename' => 'photo.jpg'],
-                                            ['name' => 'caption', 'contents' => 'Скачано через @sfayzttbot'],
-                                        ],
-                                    ]);
-                                } else {
-                                    echo "Отправка альбома из " . count($downloadedFiles) . " слайдов в Telegram...\n";
-                                    $mediaGroup = [];
-                                    $multipart = [
+                            if (count($validImages) === 1) {
+                                $client->post($telegramApiUrl . 'sendPhoto', [
+                                    'multipart' => [
                                         ['name' => 'chat_id', 'contents' => (string)$chatId],
-                                    ];
+                                        ['name' => 'photo',   'contents' => fopen($validImages[0], 'r'), 'filename' => 'photo.jpg'],
+                                        ['name' => 'caption', 'contents' => 'Скачано через @sfayzttbot'],
+                                    ],
+                                ]);
+                            } else {
+                                $mediaGroup = [];
+                                $multipart = [
+                                    ['name' => 'chat_id', 'contents' => (string)$chatId],
+                                ];
 
-                                    foreach ($downloadedFiles as $i => $path) {
-                                        $attachName = "photo_{$i}";
-                                        $multipart[] = [
-                                            'name'     => $attachName,
-                                            'contents' => fopen($path, 'r'),
-                                            'filename' => "slide_{$i}.jpg",
-                                        ];
-                                        $mediaGroup[] = [
-                                            'type'    => 'photo',
-                                            'media'   => "attach://{$attachName}",
-                                            'caption' => ($i === 0) ? 'Скачано через @sfayzttbot' : '',
-                                        ];
-                                    }
-
+                                foreach (array_slice($validImages, 0, 10) as $i => $path) {
+                                    $attachName = "photo_{$i}";
                                     $multipart[] = [
-                                        'name'     => 'media',
-                                        'contents' => json_encode($mediaGroup),
+                                        'name'     => $attachName,
+                                        'contents' => fopen($path, 'r'),
+                                        'filename' => "slide_{$i}.jpg",
                                     ];
-
-                                    $client->post($telegramApiUrl . 'sendMediaGroup', [
-                                        'multipart' => $multipart,
-                                    ]);
+                                    $mediaGroup[] = [
+                                        'type'    => 'photo',
+                                        'media'   => "attach://{$attachName}",
+                                        'caption' => ($i === 0) ? 'Скачано через @sfayzttbot' : '',
+                                    ];
                                 }
 
-                                array_map('unlink', glob("{$tempDir}/*") ?: []);
-                                @rmdir($tempDir);
-                                echo "Все фото успешно доставлены.\n";
-                                continue;
+                                $multipart[] = [
+                                    'name'     => 'media',
+                                    'contents' => json_encode($mediaGroup),
+                                ];
+
+                                $client->post($telegramApiUrl . 'sendMediaGroup', [
+                                    'multipart' => $multipart,
+                                ]);
                             }
+
+                            array_map('unlink', glob("{$tempDir}/*") ?: []);
+                            @rmdir($tempDir);
+                            echo "Все слайды доставлены.\n";
+                            continue;
                         }
 
                         array_map('unlink', glob("{$tempDir}/*") ?: []);
                         @rmdir($tempDir);
                     }
 
-                    // 2. СКАЧИВАНИЕ ВИДЕО (если это обычный видеопост)
+                    // 2. ЕСЛИ ЭТО ВИДЕОПОСТ
                     echo "Скачивание видео через yt-dlp...\n";
                     $videoPath = "{$tempDir}/video.mp4";
 
