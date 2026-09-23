@@ -24,7 +24,7 @@ $client = new Client([
 ]);
 
 $offset = 0;
-echo "Бот запущен (прямой парсинг TikTok JSON)...\n";
+echo "Бот запущен...\n";
 
 while (true) {
     try {
@@ -74,12 +74,12 @@ while (true) {
                         ],
                     ]);
 
-                    // Разворачиваем мобильные ссылки vt/vm
+                    // 1. Разворачиваем короткие ссылки
                     if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
                         try {
                             $redirectRes = $client->get($tiktokUrl, [
                                 'allow_redirects' => ['max' => 10, 'track_redirects' => true],
-                                'headers' => ['User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36'],
+                                'headers' => ['User-Agent' => 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)'],
                             ]);
                             $history = $redirectRes->getHeader('X-Guzzle-Redirect-History');
                             if (!empty($history)) {
@@ -88,33 +88,47 @@ while (true) {
                         } catch (\Throwable $e) {}
                     }
 
-                    $cleanUrl = strtok($tiktokUrl, '?');
-                    echo "Запрос HTML страницы: {$cleanUrl}\n";
+                    // 2. Достаем ID и определяем тип поста
+                    preg_match('/[\/](video|photo)[\/](\d+)/', $tiktokUrl, $idMatches);
+                    $mediaType = $idMatches[1] ?? 'video';
+                    $mediaId   = $idMatches[2] ?? null;
 
-                    // 1. Забираем исходный код страницы TikTok через curl прямо с контейнера
+                    // Очищаем ссылку от пробелов и мусора
+                    if ($mediaId) {
+                        $targetUrl = "https://www.tiktok.com/@i/{$mediaType}/{$mediaId}";
+                    } else {
+                        $targetUrl = strtok($tiktokUrl, '?');
+                        $targetUrl = str_replace(' ', '%20', $targetUrl);
+                    }
+
+                    echo "Запрос HTML страницы: {$targetUrl} (Тип: {$mediaType})\n";
+
+                    // 3. Забираем HTML страницы TikTok через curl
                     $ch = curl_init();
                     curl_setopt_array($ch, [
-                        CURLOPT_URL            => $cleanUrl,
+                        CURLOPT_URL            => $targetUrl,
                         CURLOPT_RETURNTRANSFER => true,
                         CURLOPT_FOLLOWLOCATION => true,
                         CURLOPT_SSL_VERIFYPEER => false,
                         CURLOPT_TIMEOUT        => 20,
                         CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
                         CURLOPT_HTTPHEADER     => [
-                            'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                            'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                             'Accept-Language: en-US,en;q=0.9',
                         ],
                     ]);
                     $html = curl_exec($ch);
                     curl_close($ch);
 
-                    // 2. Достаем встроенный JSON объект
+                    // 4. Достаем гидратационный JSON из HTML
                     $itemStruct = null;
-
                     if (preg_match('/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)<\/script>/s', $html, $m)) {
                         $parsed = json_decode($m[1], true);
                         $defaultScope = $parsed['__DEFAULT_SCOPE__'] ?? [];
-                        $itemStruct = $defaultScope['webapp.video-detail']['itemInfo']['itemStruct'] ?? null;
+                        // Ищем структуру поста во всех возможных разделах
+                        $itemStruct = $defaultScope['webapp.video-detail']['itemInfo']['itemStruct'] 
+                                   ?? $defaultScope['webapp.photo-detail']['itemInfo']['itemStruct'] 
+                                   ?? null;
                     }
 
                     if (!$itemStruct && preg_match('/<script id="SIGI_STATE"[^>]*>(.*?)<\/script>/s', $html, $m)) {
@@ -124,7 +138,7 @@ while (true) {
                         $itemStruct = $itemModule[$firstKey] ?? null;
                     }
 
-                    // 3. ПРОВЕРКА НА КАРУСЕЛЬ ФОТО
+                    // 5. ЕСЛИ ЭТО ФОТОПОСТ (или есть картинки imagePost)
                     $photos = [];
                     if (!empty($itemStruct['imagePost']['images'])) {
                         foreach ($itemStruct['imagePost']['images'] as $img) {
@@ -135,7 +149,17 @@ while (true) {
                         }
                     }
 
+                    // Если ссылки в JSON не нашлись, но ссылка изначально /photo/ — вытаскиваем ссылки регуляркой из HTML
+                    if (empty($photos) && ($mediaType === 'photo' || str_contains($tiktokUrl, '/photo/'))) {
+                        if (preg_match_all('/"displayImage":\{"urlList":\["([^"]+)"/', $html, $matchesImg)) {
+                            foreach ($matchesImg[1] as $rawImg) {
+                                $photos[] = str_replace(['\\u002F', '\\/'], '/', $rawImg);
+                            }
+                        }
+                    }
+
                     if (!empty($photos)) {
+                        $photos = array_values(array_unique($photos));
                         echo "Найдено " . count($photos) . " фото. Скачиваю оригинал...\n";
                         $tempDir = sys_get_temp_dir() . '/' . uniqid('tt_img_');
                         @mkdir($tempDir, 0777, true);
@@ -200,37 +224,40 @@ while (true) {
                         @rmdir($tempDir);
                     }
 
-                    // 4. ЕСЛИ ЭТО ВИДЕО (скачиваем через yt-dlp)
-                    echo "Это видео, запускаю скачивание через yt-dlp...\n";
-                    $tempDir = sys_get_temp_dir();
-                    $filePrefix = uniqid('tt_vid_');
-                    $videoPath = "{$tempDir}/{$filePrefix}.mp4";
+                    // 6. ЕСЛИ ЭТО РЕАЛЬНОЕ ВИДЕО (не фотопост)
+                    if ($mediaType !== 'photo' && !str_contains($tiktokUrl, '/photo/')) {
+                        echo "Это видео, запускаю скачивание через yt-dlp...\n";
+                        $tempDir = sys_get_temp_dir();
+                        $filePrefix = uniqid('tt_vid_');
+                        $videoPath = "{$tempDir}/{$filePrefix}.mp4";
 
-                    $dlCmd = sprintf(
-                        'yt-dlp --no-warnings -f "bv*[vcodec!=none]+ba/b[vcodec!=none]" --merge-output-format mp4 -o %s %s 2>&1',
-                        escapeshellarg($videoPath),
-                        escapeshellarg($cleanUrl)
-                    );
+                        $dlCmd = sprintf(
+                            'yt-dlp --no-warnings -f "bv*[vcodec!=none]+ba/b[vcodec!=none]" --merge-output-format mp4 -o %s %s 2>&1',
+                            escapeshellarg($videoPath),
+                            escapeshellarg($targetUrl)
+                        );
 
-                    exec($dlCmd, $dlOut, $dlCode);
+                        exec($dlCmd, $dlOut, $dlCode);
 
-                    if (file_exists($videoPath) && filesize($videoPath) > 50000) {
-                        echo "Видео скачано (" . filesize($videoPath) . " байт). Отправляю в Telegram...\n";
-                        $client->post($telegramApiUrl . 'sendVideo', [
-                            'multipart' => [
-                                ['name' => 'chat_id',            'contents' => (string)$chatId],
-                                ['name' => 'video',              'contents' => fopen($videoPath, 'r'), 'filename' => 'video.mp4'],
-                                ['name' => 'caption',            'contents' => 'Скачано через @sfayzttbot'],
-                                ['name' => 'supports_streaming', 'contents' => 'true'],
-                            ],
-                        ]);
+                        if (file_exists($videoPath) && filesize($videoPath) > 50000) {
+                            echo "Видео скачано (" . filesize($videoPath) . " байт). Отправляю в Telegram...\n";
+                            $client->post($telegramApiUrl . 'sendVideo', [
+                                'multipart' => [
+                                    ['name' => 'chat_id',            'contents' => (string)$chatId],
+                                    ['name' => 'video',              'contents' => fopen($videoPath, 'r'), 'filename' => 'video.mp4'],
+                                    ['name' => 'caption',            'contents' => 'Скачано через @sfayzttbot'],
+                                    ['name' => 'supports_streaming', 'contents' => 'true'],
+                                ],
+                            ]);
+
+                            @unlink($videoPath);
+                            echo "Видео доставлено.\n";
+                            continue;
+                        }
 
                         @unlink($videoPath);
-                        echo "Видео доставлено.\n";
-                        continue;
                     }
 
-                    @unlink($videoPath);
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
