@@ -67,7 +67,7 @@ while (true) {
                         ],
                     ]);
 
-                    // 1. Разворачиваем короткие ссылки vt.tiktok.com / vm.tiktok.com
+                    // 1. Разворачиваем короткие ссылки (vt.tiktok.com, vm.tiktok.com)
                     if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
                         try {
                             $redirectResponse = $client->get($tiktokUrl, [
@@ -76,7 +76,7 @@ while (true) {
                                     'track_redirects' => true,
                                 ],
                                 'headers' => [
-                                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36',
+                                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
                                 ],
                             ]);
 
@@ -90,14 +90,19 @@ while (true) {
                         }
                     }
 
-                    // 2. Запрос к LoveTik API
+                    // 2. Очищаем URL от мусорных query-параметров (?_r=1&_t=...)
+                    $cleanUrl = strtok($tiktokUrl, '?');
+                    echo "Очищенный URL: {$cleanUrl}\n";
+
+                    // 3. Запрос к LoveTik API
                     $parseResponse = $client->post('https://lovetik.com/api/ajax/search', [
                         'form_params' => [
-                            'query' => $tiktokUrl,
+                            'query' => $cleanUrl,
                         ],
                         'headers' => [
-                            'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36',
+                            'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
                             'Accept'     => 'application/json',
+                            'Referer'    => 'https://lovetik.com/',
                         ],
                         'http_errors' => false,
                     ]);
@@ -108,18 +113,21 @@ while (true) {
                     $data = json_decode($rawBody, true);
                     $videoUrl = null;
 
-                    // Достаем прямую ссылку на видео без водяного знака
+                    // 4. Достаем ссылку на видео без водяного знака
                     if (!empty($data['links'])) {
                         foreach ($data['links'] as $link) {
-                            if (!empty($link['a'])) {
+                            if (!empty($link['a']) && empty($link['watermark'])) {
                                 $videoUrl = $link['a'];
                                 break;
                             }
                         }
+                        if (!$videoUrl && !empty($data['links'][0]['a'])) {
+                            $videoUrl = $data['links'][0]['a'];
+                        }
                     }
 
                     if ($videoUrl) {
-                        echo "Ссылка получена, отправляю в Telegram...\n";
+                        echo "Ссылка найдена, отправка в Telegram...\n";
                         $client->post($telegramApiUrl . 'sendVideo', [
                             'json' => [
                                 'chat_id'            => $chatId,
