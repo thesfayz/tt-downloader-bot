@@ -17,14 +17,16 @@ if (!$botToken) {
 
 $telegramApiUrl = "https://api.telegram.org/bot{$botToken}/";
 
+// ВСТАВЬ СЮДА СВОЮ ССЫЛКУ НА WORKER ИЗ ШАГА 2
+$workerUrl = "https://tikwm-proxy.sfayzullaev007.workers.dev";
+
 $client = new Client([
     'timeout'         => 30.0,
     'allow_redirects' => true,
-    'verify'          => false,
 ]);
 
 $offset = 0;
-echo "Бот TikWM (HD видео + фото-карусели) запущен...\n";
+echo "Бот через Cloudflare Worker запущен...\n";
 
 while (true) {
     try {
@@ -68,7 +70,7 @@ while (true) {
                         ],
                     ]);
 
-                    // 1. Разворачиваем короткие ссылки (vt.tiktok.com / vm.tiktok.com)
+                    // Разворачиваем короткие ссылки
                     if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
                         try {
                             $redirectResponse = $client->get($tiktokUrl, [
@@ -77,7 +79,7 @@ while (true) {
                                     'track_redirects' => true,
                                 ],
                                 'headers' => [
-                                    'User-Agent' => 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+                                    'User-Agent' => 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
                                 ],
                             ]);
 
@@ -86,112 +88,36 @@ while (true) {
                                 $tiktokUrl = end($history);
                             }
                         } catch (\Throwable $e) {
-                            echo "Ошибка разворота редиректа: " . $e->getMessage() . "\n";
+                            echo "Ошибка редиректа: " . $e->getMessage() . "\n";
                         }
                     }
 
-                    // 2. Извлекаем ID видео и собираем каноничный URL без пробелов и мусора
+                    // Чистый URL
                     preg_match('/\/video\/(\d+)/', $tiktokUrl, $idMatches);
                     $videoId = $idMatches[1] ?? null;
+                    $cleanUrl = $videoId ? "https://www.tiktok.com/@i/video/{$videoId}" : strtok($tiktokUrl, '?');
 
-                    if ($videoId) {
-                        $cleanUrl = "https://www.tiktok.com/@i/video/{$videoId}";
-                    } else {
-                        $cleanUrl = strtok($tiktokUrl, '?');
-                    }
+                    echo "Запрос через Cloudflare Worker для: {$cleanUrl}\n";
 
-                    echo "Итоговый URL для парсинга: {$cleanUrl}\n";
+                    // Стучимся на свой воркер
+                    $response = $client->get($workerUrl, [
+                        'query' => [
+                            'url' => $cleanUrl,
+                        ],
+                        'http_errors' => false,
+                    ]);
 
-                    $mediaData = null;
+                    $body = (string)$response->getBody();
+                    $json = json_decode($body, true);
 
-                    // 3. Основной запрос: TikWM API
-                    try {
-                        $tikwmResponse = $client->post('https://www.tikwm.com/api/', [
-                            'form_params' => [
-                                'url'   => $cleanUrl,
-                                'count' => 12,
-                                'cursor'=> 0,
-                                'web'   => 1,
-                                'hd'    => 1,
-                            ],
-                            'headers' => [
-                                'User-Agent'      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-                                'Accept'          => 'application/json, text/javascript, */*; q=0.01',
-                                'X-Requested-With'=> 'XMLHttpRequest',
-                                'Origin'          => 'https://www.tikwm.com',
-                                'Referer'         => 'https://www.tikwm.com/',
-                            ],
-                            'http_errors' => false,
-                            'timeout'     => 15,
-                        ]);
+                    if (isset($json['code']) && $json['code'] === 0 && !empty($json['data'])) {
+                        $item = $json['data'];
 
-                        $body = (string)$tikwmResponse->getBody();
-                        $json = json_decode($body, true);
-
-                        if (isset($json['code']) && $json['code'] === 0 && !empty($json['data'])) {
-                            $mediaData = [
-                                'type'   => !empty($json['data']['images']) ? 'photos' : 'video',
-                                'images' => $json['data']['images'] ?? [],
-                                'video'  => $json['data']['play'] ?? null,
-                            ];
-                            echo "Успешно получено от TikWM\n";
-                        } else {
-                            echo "TikWM вернул: {$body}\n";
-                        }
-                    } catch (\Throwable $e) {
-                        echo "Сбой TikWM: " . $e->getMessage() . "\n";
-                    }
-
-                    // 4. Резервный шлюз LoveTik (если TikWM сбоит)
-                    if (!$mediaData) {
-                        try {
-                            $backupResponse = $client->post('https://lovetik.com/api/ajax/search', [
-                                'form_params' => [
-                                    'query' => $cleanUrl,
-                                ],
-                                'headers' => [
-                                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-                                    'Accept'     => 'application/json',
-                                    'Referer'    => 'https://lovetik.com/',
-                                ],
-                                'http_errors' => false,
-                                'timeout'     => 15,
-                            ]);
-
-                            $bJson = json_decode((string)$backupResponse->getBody(), true);
-                            $bVideo = null;
-
-                            if (!empty($bJson['links'])) {
-                                foreach ($bJson['links'] as $link) {
-                                    if (!empty($link['a']) && empty($link['watermark'])) {
-                                        $bVideo = $link['a'];
-                                        break;
-                                    }
-                                }
-                                if (!$bVideo && !empty($bJson['links'][0]['a'])) {
-                                    $bVideo = $bJson['links'][0]['a'];
-                                }
-                            }
-
-                            if ($bVideo) {
-                                $mediaData = [
-                                    'type'  => 'video',
-                                    'video' => $bVideo,
-                                ];
-                                echo "Успешно получено от резервного API (LoveTik)\n";
-                            }
-                        } catch (\Throwable $e) {
-                            echo "Сбой резервного API: " . $e->getMessage() . "\n";
-                        }
-                    }
-
-                    // 5. Отправка результата в Telegram
-                    if ($mediaData) {
-                        // Альбом фотографий
-                        if ($mediaData['type'] === 'photos' && !empty($mediaData['images'])) {
-                            echo "Отправляю " . count($mediaData['images']) . " фото...\n";
+                        // 1. Если это карусель фото
+                        if (!empty($item['images']) && is_array($item['images'])) {
+                            echo "Карусель из " . count($item['images']) . " фото. Отправляю...\n";
                             $mediaGroup = [];
-                            $photos = array_slice($mediaData['images'], 0, 10);
+                            $photos = array_slice($item['images'], 0, 10);
                             foreach ($photos as $i => $imgUrl) {
                                 $mediaGroup[] = [
                                     'type'    => 'photo',
@@ -206,18 +132,18 @@ while (true) {
                                     'media'   => $mediaGroup,
                                 ],
                             ]);
-                            echo "Фото доставлены.\n";
+                            echo "Фотографии отправлены.\n";
                             continue;
                         }
 
-                        // Видео без водяного знака
-                        if ($mediaData['type'] === 'video' && !empty($mediaData['video'])) {
-                            $videoUrl = $mediaData['video'];
+                        // 2. Если это видео
+                        $videoUrl = $item['play'] ?? null;
+                        if ($videoUrl) {
                             if (!str_starts_with($videoUrl, 'http')) {
                                 $videoUrl = 'https://www.tikwm.com' . $videoUrl;
                             }
 
-                            echo "Отправляю видео напрямую через CDN...\n";
+                            echo "Отправляю видео напрямую...\n";
                             $client->post($telegramApiUrl . 'sendVideo', [
                                 'json' => [
                                     'chat_id'            => $chatId,
@@ -226,22 +152,23 @@ while (true) {
                                     'supports_streaming' => true,
                                 ],
                             ]);
-                            echo "Видео доставлено.\n";
+                            echo "Видео отправлено.\n";
                             continue;
                         }
                     }
 
+                    echo "Ошибка ответа от воркера: {$body}\n";
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
-                            'text'    => "Не удалось скачать медиа по этой ссылке.",
+                            'text'    => "Не удалось получить медиа по этой ссылке.",
                         ],
                     ]);
                 }
             }
         }
     } catch (\Throwable $e) {
-        echo "Ошибка: " . $e->getMessage() . "\n";
+        echo "Ошибка цикла: " . $e->getMessage() . "\n";
         sleep(2);
     }
 
