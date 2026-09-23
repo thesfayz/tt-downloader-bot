@@ -67,7 +67,7 @@ while (true) {
                         ],
                     ]);
 
-                    // Разворачиваем короткие ссылки (vt.tiktok.com, vm.tiktok.com)
+                    // 1. Разворачиваем короткие ссылки (vt.tiktok.com, vm.tiktok.com)
                     if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
                         try {
                             $redirectResponse = $client->get($tiktokUrl, [
@@ -90,46 +90,55 @@ while (true) {
                         }
                     }
 
-                    // Запрос к TikWM API с браузерными заголовками
-                    $parserResponse = $client->get('https://www.tikwm.com/api/', [
+                    // 2. Достаем ID видео из ссылки
+                    preg_match('/\/video\/(\d+)/', $tiktokUrl, $idMatches);
+                    $videoId = $idMatches[1] ?? null;
+
+                    if (!$videoId) {
+                        $client->post($telegramApiUrl . 'sendMessage', [
+                            'json' => [
+                                'chat_id' => $chatId,
+                                'text'    => "Не удалось извлечь ID видео из ссылки.",
+                            ],
+                        ]);
+                        continue;
+                    }
+
+                    echo "Извлечен Video ID: {$videoId}\n";
+
+                    // 3. Запрос напрямую к мобильному API TikTok (без Cloudflare прокси)
+                    $tiktokApiResponse = $client->get('https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/feed/', [
                         'query' => [
-                            'url' => $tiktokUrl,
-                            'hd'  => 1,
+                            'aweme_id' => $videoId,
                         ],
                         'headers' => [
-                            'User-Agent'      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-                            'Accept'          => 'application/json, text/javascript, */*; q=0.01',
-                            'Accept-Language' => 'en-US,en;q=0.9',
-                            'Referer'         => 'https://www.tikwm.com/',
-                            'Origin'          => 'https://www.tikwm.com',
-                            'X-Requested-With'=> 'XMLHttpRequest',
+                            'User-Agent' => 'com.zhiliaoapp.musically/2022600030 (Linux; U; Android 10; en_US; Pixel 4; Build/QQ3A.200805.001; Cronet/TTNetVersion:b4d74d15)',
+                            'Accept'     => 'application/json',
                         ],
                         'http_errors' => false,
                     ]);
 
-                    $rawBody = (string)$parserResponse->getBody();
-                    echo "HTTP статус TikWM: " . $parserResponse->getStatusCode() . "\n";
-                    echo "TikWM response: " . $rawBody . "\n";
+                    $rawBody = (string)$tiktokApiResponse->getBody();
+                    echo "HTTP статус TikTok API: " . $tiktokApiResponse->getStatusCode() . "\n";
 
                     $data = json_decode($rawBody, true);
+                    $videoUrl = $data['aweme_list'][0]['video']['play_addr']['url_list'][0] ?? null;
 
-                    if (isset($data['code']) && $data['code'] === 0 && !empty($data['data']['play'])) {
-                        $videoUrl = $data['data']['play'];
-
-                        // Отправляем видео пользователю
+                    if ($videoUrl) {
+                        echo "Получена прямая ссылка на видео, отправляю в TG...\n";
                         $client->post($telegramApiUrl . 'sendVideo', [
                             'json' => [
-                                'chat_id'             => $chatId,
-                                'video'               => $videoUrl,
-                                'caption'             => 'Скачано через @sfayzttbot',
-                                'supports_streaming'  => true,
+                                'chat_id'            => $chatId,
+                                'video'              => $videoUrl,
+                                'caption'            => 'Скачано через @sfayzttbot',
+                                'supports_streaming' => true,
                             ],
                         ]);
                     } else {
                         $client->post($telegramApiUrl . 'sendMessage', [
                             'json' => [
                                 'chat_id' => $chatId,
-                                'text'    => "Не удалось найти видео по этой ссылке.",
+                                'text'    => "Не удалось получить видео (возможно, приватное или удалено).",
                             ],
                         ]);
                     }
@@ -141,5 +150,5 @@ while (true) {
         sleep(2);
     }
 
-    usleep(500000); // 0.5 сек задержки между запросами
+    usleep(500000); // 0.5 сек паузы между запросами
 }
