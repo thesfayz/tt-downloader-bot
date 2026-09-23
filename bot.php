@@ -67,7 +67,7 @@ while (true) {
                         ],
                     ]);
 
-                    // Разворачиваем короткие ссылки
+                    // 1. Разворачиваем короткие ссылки vt.tiktok.com / vm.tiktok.com
                     if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
                         try {
                             $redirectResponse = $client->get($tiktokUrl, [
@@ -90,30 +90,36 @@ while (true) {
                         }
                     }
 
-                    // Используем Cobalt API (не режет дата-центры)
-                    $cobaltResponse = $client->post('https://api.cobalt.tools/api/json', [
-                        'json' => [
-                            'url'          => $tiktokUrl,
-                            'vQuality'     => 'max',
-                            'filenamePattern' => 'classic'
+                    // 2. Запрос к LoveTik API
+                    $parseResponse = $client->post('https://lovetik.com/api/ajax/search', [
+                        'form_params' => [
+                            'query' => $tiktokUrl,
                         ],
                         'headers' => [
-                            'Accept'       => 'application/json',
-                            'Content-Type' => 'application/json',
-                            'User-Agent'   => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36'
+                            'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36',
+                            'Accept'     => 'application/json',
                         ],
                         'http_errors' => false,
                     ]);
 
-                    $rawBody = (string)$cobaltResponse->getBody();
-                    echo "HTTP статус Cobalt: " . $cobaltResponse->getStatusCode() . "\n";
-                    echo "Ответ API: " . $rawBody . "\n";
+                    $rawBody = (string)$parseResponse->getBody();
+                    echo "API ответ: " . $rawBody . "\n";
 
                     $data = json_decode($rawBody, true);
-                    $videoUrl = $data['url'] ?? null;
+                    $videoUrl = null;
+
+                    // Достаем прямую ссылку на видео без водяного знака
+                    if (!empty($data['links'])) {
+                        foreach ($data['links'] as $link) {
+                            if (!empty($link['a'])) {
+                                $videoUrl = $link['a'];
+                                break;
+                            }
+                        }
+                    }
 
                     if ($videoUrl) {
-                        echo "Отправка видео в Telegram...\n";
+                        echo "Ссылка получена, отправляю в Telegram...\n";
                         $client->post($telegramApiUrl . 'sendVideo', [
                             'json' => [
                                 'chat_id'            => $chatId,
@@ -126,7 +132,7 @@ while (true) {
                         $client->post($telegramApiUrl . 'sendMessage', [
                             'json' => [
                                 'chat_id' => $chatId,
-                                'text'    => "Не удалось получить прямую ссылку на видео.",
+                                'text'    => "Не удалось получить видео по этой ссылке.",
                             ],
                         ]);
                     }
