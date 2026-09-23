@@ -18,13 +18,13 @@ if (!$botToken) {
 $telegramApiUrl = "https://api.telegram.org/bot{$botToken}/";
 
 $client = new Client([
-    'timeout'         => 30.0,
+    'timeout'         => 60.0,
     'allow_redirects' => true,
     'verify'          => false,
 ]);
 
 $offset = 0;
-echo "Бот запущен...\n";
+echo "Бот на базе локального yt-dlp запущен...\n";
 
 while (true) {
     try {
@@ -58,7 +58,7 @@ while (true) {
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
-                            'text'    => "Отправь ссылку на TikTok (видео или фото-карусель), и я пришлю всё без водяного знака.",
+                            'text'    => "Отправь ссылку на TikTok (видео или фото-карусель), и я скачаю всё без водяного знака.",
                         ],
                     ]);
                     continue;
@@ -70,11 +70,11 @@ while (true) {
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
-                            'text'    => "Загружаю медиа...",
+                            'text'    => "Обрабатываю ссылку, секунду...",
                         ],
                     ]);
 
-                    // 1. Разворачиваем короткие ссылки
+                    // Разворачиваем короткие ссылки vt.tiktok.com
                     if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
                         try {
                             $redirectResponse = $client->get($tiktokUrl, [
@@ -97,117 +97,109 @@ while (true) {
                     }
 
                     $cleanUrl = strtok($tiktokUrl, '?');
-                    echo "Запрос для URL: {$cleanUrl}\n";
+                    echo "Запуск yt-dlp для: {$cleanUrl}\n";
 
-                    $mediaData = null;
+                    // 1. Получаем метаданные через yt-dlp
+                    $dumpCmd = sprintf(
+                        'yt-dlp -J --no-warnings --no-playlist %s 2>&1',
+                        escapeshellarg($cleanUrl)
+                    );
 
-                    // 2. Запрос к TikMate API (работает из любых дата-центров)
-                    try {
-                        $res = $client->post('https://api.tikmate.app/api/lookup', [
-                            'form_params' => [
-                                'url' => $cleanUrl,
+                    $jsonRaw = shell_exec($dumpCmd);
+                    $info = json_decode($jsonRaw, true);
+
+                    // 2. Если это фото-карусель (entries содержат картинки)
+                    $imageUrls = [];
+                    if (!empty($info['entries'])) {
+                        foreach ($info['entries'] as $entry) {
+                            if (!empty($entry['url'])) {
+                                $imageUrls[] = $entry['url'];
+                            }
+                        }
+                    }
+
+                    if (!empty($imageUrls)) {
+                        echo "Найдена фото-карусель из " . count($imageUrls) . " фото. Отправляю...\n";
+                        $mediaGroup = [];
+                        $photos = array_slice($imageUrls, 0, 10);
+                        foreach ($photos as $i => $imgUrl) {
+                            $mediaGroup[] = [
+                                'type'    => 'photo',
+                                'media'   => $imgUrl,
+                                'caption' => ($i === 0) ? 'Скачано через @sfayzttbot' : '',
+                            ];
+                        }
+
+                        $client->post($telegramApiUrl . 'sendMediaGroup', [
+                            'json' => [
+                                'chat_id' => $chatId,
+                                'media'   => $mediaGroup,
                             ],
-                            'headers' => [
-                                'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                        ]);
+                        echo "Фото доставлены.\n";
+                        continue;
+                    }
+
+                    // 3. Если это видео: качаем без сжатия в исходном качестве
+                    $tempDir = sys_get_temp_dir();
+                    $filePrefix = uniqid('tt_');
+                    $outputPattern = "{$tempDir}/{$filePrefix}.%(ext)s";
+
+                    $dlCmd = sprintf(
+                        'yt-dlp --no-warnings -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o %s %s 2>&1',
+                        escapeshellarg($outputPattern),
+                        escapeshellarg($cleanUrl)
+                    );
+
+                    echo "Скачивание видео через yt-dlp...\n";
+                    exec($dlCmd, $dlOut, $dlCode);
+
+                    $videoPath = "{$tempDir}/{$filePrefix}.mp4";
+
+                    if (file_exists($videoPath) && filesize($videoPath) > 1000) {
+                        echo "Видео скачано (" . filesize($videoPath) . " байт). Отправляю в Telegram...\n";
+
+                        $client->post($telegramApiUrl . 'sendVideo', [
+                            'multipart' => [
+                                [
+                                    'name'     => 'chat_id',
+                                    'contents' => (string)$chatId,
+                                ],
+                                [
+                                    'name'     => 'video',
+                                    'contents' => fopen($videoPath, 'r'),
+                                    'filename' => 'video.mp4',
+                                ],
+                                [
+                                    'name'     => 'caption',
+                                    'contents' => 'Скачано через @sfayzttbot',
+                                ],
+                                [
+                                    'name'     => 'supports_streaming',
+                                    'contents' => 'true',
+                                ],
                             ],
-                            'timeout' => 15,
                         ]);
 
-                        $data = json_decode((string)$res->getBody(), true);
-
-                        if (!empty($data['success'])) {
-                            // Формируем прямую ссылку на видео без водяного знака через шлюз TikMate
-                            $token = $data['token'] ?? null;
-                            $videoId = $data['id'] ?? null;
-
-                            if ($token && $videoId) {
-                                $mediaData = [
-                                    'type'  => 'video',
-                                    'video' => "https://tikmate.app/download/{$token}/{$videoId}.mp4?hd=1",
-                                ];
-                            }
-                        }
-                    } catch (\Throwable $e) {
-                        echo "TikMate сбой: " . $e->getMessage() . "\n";
-                    }
-
-                    // 3. Если это фото-карусель или TikMate не сработал — резервный парсер
-                    if (!$mediaData) {
-                        try {
-                            $backupRes = $client->get('https://widipe.com/download/tiktok', [
-                                'query' => ['url' => $cleanUrl],
-                                'timeout' => 15,
-                            ]);
-
-                            $bData = json_decode((string)$backupRes->getBody(), true);
-                            if (!empty($bData['result']['images']) && is_array($bData['result']['images'])) {
-                                $mediaData = [
-                                    'type'   => 'photos',
-                                    'images' => $bData['result']['images'],
-                                ];
-                            } elseif (!empty($bData['result']['video'])) {
-                                $mediaData = [
-                                    'type'  => 'video',
-                                    'video' => $bData['result']['video'],
-                                ];
-                            }
-                        } catch (\Throwable $e) {
-                            echo "Резерв сбой: " . $e->getMessage() . "\n";
-                        }
-                    }
-
-                    // 4. Отправка в Telegram
-                    if ($mediaData) {
-                        // Фото-карусель
-                        if ($mediaData['type'] === 'photos' && !empty($mediaData['images'])) {
-                            echo "Карусель из " . count($mediaData['images']) . " фото. Отправка...\n";
-                            $mediaGroup = [];
-                            $photos = array_slice($mediaData['images'], 0, 10);
-                            foreach ($photos as $i => $imgUrl) {
-                                $mediaGroup[] = [
-                                    'type'    => 'photo',
-                                    'media'   => $imgUrl,
-                                    'caption' => ($i === 0) ? 'Скачано через @sfayzttbot' : '',
-                                ];
-                            }
-
-                            $client->post($telegramApiUrl . 'sendMediaGroup', [
-                                'json' => [
-                                    'chat_id' => $chatId,
-                                    'media'   => $mediaGroup,
-                                ],
-                            ]);
-                            echo "Фото доставлены.\n";
-                            continue;
-                        }
-
-                        // Видео (прямая ссылка)
-                        if ($mediaData['type'] === 'video' && !empty($mediaData['video'])) {
-                            echo "Отправка видео напрямую в Telegram...\n";
-                            $client->post($telegramApiUrl . 'sendVideo', [
-                                'json' => [
-                                    'chat_id'            => $chatId,
-                                    'video'              => $mediaData['video'],
-                                    'caption'            => 'Скачано через @sfayzttbot',
-                                    'supports_streaming' => true,
-                                ],
-                            ]);
-                            echo "Видео успешно доставлено.\n";
-                            continue;
-                        }
+                        @unlink($videoPath);
+                        echo "Видео доставлено.\n";
+                        continue;
+                    } else {
+                        @unlink($videoPath);
+                        echo "Ошибка загрузки: " . implode(" | ", array_slice((array)$dlOut, -3)) . "\n";
                     }
 
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
-                            'text'    => "Не удалось скачать медиа по этой ссылке.",
+                            'text'    => "Не удалось загрузить медиа по этой ссылке.",
                         ],
                     ]);
                 }
             }
         }
     } catch (\Throwable $e) {
-        echo "Ошибка в цикле: " . $e->getMessage() . "\n";
+        echo "Ошибка: " . $e->getMessage() . "\n";
         sleep(2);
     }
 
