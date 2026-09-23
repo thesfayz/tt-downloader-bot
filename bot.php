@@ -19,12 +19,12 @@ $telegramApiUrl = "https://api.telegram.org/bot{$botToken}/";
 $workerUrl = "https://tikwm-proxy.sfayzullaev007.workers.dev/";
 
 $client = new Client([
-    'timeout'         => 30.0,
+    'timeout'         => 60.0,
     'allow_redirects' => true,
 ]);
 
 $offset = 0;
-echo "Бот через собственный Cloudflare Worker запущен...\n";
+echo "Бот через Cloudflare Worker (с прямой передачей потока) запущен...\n";
 
 while (true) {
     try {
@@ -68,7 +68,7 @@ while (true) {
                         ],
                     ]);
 
-                    // 1. Разворачиваем короткие ссылки
+                    // Разворачиваем короткие ссылки vt/vm
                     if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
                         try {
                             $redirectResponse = $client->get($tiktokUrl, [
@@ -90,20 +90,16 @@ while (true) {
                         }
                     }
 
-                    // Чистый каноничный URL без пробелов и мусорных GET-параметров
                     preg_match('/\/video\/(\d+)/', $tiktokUrl, $idMatches);
                     $videoId = $idMatches[1] ?? null;
                     $cleanUrl = $videoId ? "https://www.tiktok.com/@i/video/{$videoId}" : strtok($tiktokUrl, '?');
 
-                    echo "Запрос через твой Cloudflare Worker для: {$cleanUrl}\n";
+                    echo "Запрос через воркер для: {$cleanUrl}\n";
 
-                    // 2. Запрос в Cloudflare Worker
                     $response = $client->get($workerUrl, [
-                        'query' => [
-                            'url' => $cleanUrl,
-                        ],
+                        'query'       => ['url' => $cleanUrl],
                         'http_errors' => false,
-                        'timeout'     => 15,
+                        'timeout'     => 20,
                     ]);
 
                     $rawBody = (string)$response->getBody();
@@ -112,9 +108,9 @@ while (true) {
                     if (isset($data['code']) && $data['code'] === 0 && !empty($data['data'])) {
                         $item = $data['data'];
 
-                        // ФОТО-КАРУСЕЛЬ
+                        // 1. Обработка карусели фотографий
                         if (!empty($item['images']) && is_array($item['images'])) {
-                            echo "Найдено " . count($item['images']) . " фото. Отправка в TG...\n";
+                            echo "Карусель из " . count($item['images']) . " фото. Отправка...\n";
                             $mediaGroup = [];
                             $photos = array_slice($item['images'], 0, 10);
                             foreach ($photos as $i => $imgUrl) {
@@ -131,28 +127,60 @@ while (true) {
                                     'media'   => $mediaGroup,
                                 ],
                             ]);
-                            echo "Фото отправлены.\n";
+                            echo "Фото доставлены.\n";
                             continue;
                         }
 
-                        // ВИДЕО БЕЗ ВОДЯНОГО ЗНАКА
+                        // 2. Обработка видео: скачиваем файл ботом и отправляем через multipart
                         $videoUrl = $item['play'] ?? null;
                         if ($videoUrl) {
-                            if (!str_starts_with($videoUrl, 'http')) {
-                                $videoUrl = 'https://www.tikwm.com' . $videoUrl;
+                            echo "Загрузка видео с CDN для передачи в TG...\n";
+                            $tempFile = tempnam(sys_get_temp_dir(), 'tt_vid_');
+                            
+                            $downloadSuccess = false;
+                            try {
+                                $client->get($videoUrl, [
+                                    'sink'    => $tempFile,
+                                    'headers' => [
+                                        'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                                        'Referer'    => 'https://www.tiktok.com/',
+                                    ],
+                                    'timeout' => 40,
+                                ]);
+                                $downloadSuccess = (file_exists($tempFile) && filesize($tempFile) > 1000);
+                            } catch (\Throwable $dlErr) {
+                                echo "Ошибка скачивания видеофайла: " . $dlErr->getMessage() . "\n";
                             }
 
-                            echo "Отправка видео напрямую по URL...\n";
-                            $client->post($telegramApiUrl . 'sendVideo', [
-                                'json' => [
-                                    'chat_id'            => $chatId,
-                                    'video'              => $videoUrl,
-                                    'caption'            => 'Скачано через @sfayzttbot',
-                                    'supports_streaming' => true,
-                                ],
-                            ]);
-                            echo "Видео отправлено.\n";
-                            continue;
+                            if ($downloadSuccess) {
+                                echo "Видео скачано (" . filesize($tempFile) . " байт). Отправляю в Telegram...\n";
+                                $client->post($telegramApiUrl . 'sendVideo', [
+                                    'multipart' => [
+                                        [
+                                            'name'     => 'chat_id',
+                                            'contents' => (string)$chatId,
+                                        ],
+                                        [
+                                            'name'     => 'video',
+                                            'contents' => fopen($tempFile, 'r'),
+                                            'filename' => 'video.mp4',
+                                        ],
+                                        [
+                                            'name'     => 'caption',
+                                            'contents' => 'Скачано через @sfayzttbot',
+                                        ],
+                                        [
+                                            'name'     => 'supports_streaming',
+                                            'contents' => 'true',
+                                        ],
+                                    ],
+                                ]);
+                                @unlink($tempFile);
+                                echo "Видео успешно доставлено.\n";
+                                continue;
+                            } else {
+                                @unlink($tempFile);
+                            }
                         }
                     }
 
