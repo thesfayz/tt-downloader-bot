@@ -74,7 +74,7 @@ while (true) {
                         ],
                     ]);
 
-                    // Разворачиваем короткие ссылки vt/vm
+                    // Разворачиваем короткие ссылки
                     if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
                         try {
                             $redirectRes = $client->get($tiktokUrl, [
@@ -88,7 +88,7 @@ while (true) {
                         } catch (\Throwable $e) {}
                     }
 
-                    // Нормализуем URL по ID
+                    // Нормализуем URL
                     preg_match('/[\/](video|photo)[\/](\d+)/', $tiktokUrl, $idMatches);
                     $mediaType = $idMatches[1] ?? 'video';
                     $mediaId   = $idMatches[2] ?? null;
@@ -101,7 +101,7 @@ while (true) {
                     $tempDir = sys_get_temp_dir() . '/' . uniqid('tt_');
                     @mkdir($tempDir, 0777, true);
 
-                    // ВЕТКА 1: ЭТО ФОТОПОСТ
+                    // 1. ФОТОПОСТ
                     if ($mediaType === 'photo' || str_contains($tiktokUrl, '/photo/')) {
                         echo "Скачивание фото-слайдов через yt-dlp...\n";
                         
@@ -113,16 +113,22 @@ while (true) {
                         );
                         exec($cmd);
 
-                        // Собираем скачанные изображения
-                        $images = glob("{$tempDir}/*.{jpg,jpeg,png,webp}", GLOB_BRACE);
-
-                        // Фильтруем слишком маленькие файлы (аватарки/иконки)
+                        // Чтение файлов без GLOB_BRACE (совместимо со всеми ОС)
+                        $allFiles = scandir($tempDir) ?: [];
                         $validImages = [];
-                        foreach ($images as $img) {
-                            if (filesize($img) > 10000) { // больше 10 КБ
-                                $validImages[] = $img;
+
+                        foreach ($allFiles as $f) {
+                            if ($f === '.' || $f === '..') continue;
+                            $fullPath = "{$tempDir}/{$f}";
+                            $ext = strtolower(pathinfo($fullPath, PATHINFO_EXTENSION));
+
+                            if (in_array($ext, ['jpg', 'jpeg', 'png', 'webp'])) {
+                                if (filesize($fullPath) > 10000) {
+                                    $validImages[] = $fullPath;
+                                }
                             }
                         }
+
                         sort($validImages);
 
                         if (!empty($validImages)) {
@@ -166,14 +172,14 @@ while (true) {
                                 ]);
                             }
 
-                            array_map('unlink', glob("{$tempDir}/*"));
+                            array_map('unlink', glob("{$tempDir}/*") ?: []);
                             @rmdir($tempDir);
                             echo "Фото доставлены.\n";
                             continue;
                         }
                     }
 
-                    // ВЕТКА 2: ЭТО ВИДЕОПОСТ
+                    // 2. ВИДЕОПОСТ
                     echo "Скачивание видео через yt-dlp...\n";
                     $videoPath = "{$tempDir}/video.mp4";
 
@@ -195,13 +201,13 @@ while (true) {
                             ],
                         ]);
 
-                        array_map('unlink', glob("{$tempDir}/*"));
+                        array_map('unlink', glob("{$tempDir}/*") ?: []);
                         @rmdir($tempDir);
                         echo "Видео доставлено.\n";
                         continue;
                     }
 
-                    array_map('unlink', glob("{$tempDir}/*"));
+                    array_map('unlink', glob("{$tempDir}/*") ?: []);
                     @rmdir($tempDir);
 
                     $client->post($telegramApiUrl . 'sendMessage', [
