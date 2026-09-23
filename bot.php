@@ -18,12 +18,12 @@ if (!$botToken) {
 $telegramApiUrl = "https://api.telegram.org/bot{$botToken}/";
 
 $client = new Client([
-    'timeout'         => 60.0,
+    'timeout'         => 30.0,
     'allow_redirects' => true,
 ]);
 
 $offset = 0;
-echo "Бот запущен...\n";
+echo "Бот TikWM (видео + фото) запущен...\n";
 
 while (true) {
     try {
@@ -51,7 +51,7 @@ while (true) {
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
-                            'text'    => "Отправь ссылку на TikTok, и я пришлю видео без водяного знака.",
+                            'text'    => "Отправь ссылку на TikTok (видео или фото-карусель), и я пришлю всё без водяного знака.",
                         ],
                     ]);
                     continue;
@@ -63,55 +63,113 @@ while (true) {
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
-                            'text'    => "Скачиваю без водяного знака, подожди немного...",
+                            'text'    => "Загружаю медиа без водяного знака...",
                         ],
                     ]);
 
-                    $fileId = uniqid('tt_');
-                    $outputPath = __DIR__ . "/downloads/{$fileId}.mp4";
-
-                    // Команда вызова yt-dlp
-                    $cmd = sprintf(
-                        'yt-dlp --no-warnings -f "best[ext=mp4]/best" -o %s %s 2>&1',
-                        escapeshellarg($outputPath),
-                        escapeshellarg($tiktokUrl)
-                    );
-
-                    echo "Выполняю команду...\n";
-                    exec($cmd, $output, $returnCode);
-
-                    if ($returnCode === 0 && file_exists($outputPath)) {
-                        echo "Видео скачано локально. Отправка в Telegram...\n";
-
-                        $client->post($telegramApiUrl . 'sendVideo', [
-                            'multipart' => [
-                                [
-                                    'name'     => 'chat_id',
-                                    'contents' => (string)$chatId,
+                    // 1. Разворачиваем короткие ссылки vt/vm
+                    if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
+                        try {
+                            $redirectResponse = $client->get($tiktokUrl, [
+                                'allow_redirects' => [
+                                    'max'             => 10,
+                                    'track_redirects' => true,
                                 ],
-                                [
-                                    'name'     => 'video',
-                                    'contents' => fopen($outputPath, 'r'),
-                                    'filename' => 'video.mp4',
+                                'headers' => [
+                                    'User-Agent' => 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
                                 ],
-                                [
-                                    'name'     => 'caption',
-                                    'contents' => 'Скачано через @sfayzttbot',
-                                ],
-                            ],
-                        ]);
+                            ]);
 
-                        unlink($outputPath); // Удаляем временный файл
-                        echo "Файл отправлен и удален.\n";
-                    } else {
-                        echo "Ошибка yt-dlp: " . implode("\n", $output) . "\n";
-                        $client->post($telegramApiUrl . 'sendMessage', [
-                            'json' => [
-                                'chat_id' => $chatId,
-                                'text'    => "Не удалось скачать видео через.",
-                            ],
-                        ]);
+                            $history = $redirectResponse->getHeader('X-Guzzle-Redirect-History');
+                            if (!empty($history)) {
+                                $tiktokUrl = end($history);
+                            }
+                        } catch (\Throwable $e) {
+                            echo "Ошибка разворота редиректа: " . $e->getMessage() . "\n";
+                        }
                     }
+
+                    $cleanUrl = strtok($tiktokUrl, '?');
+                    echo "Запрос к TikWM для: {$cleanUrl}\n";
+
+                    // 2. Запрос к TikWM через POST form_params (обходит Cloudflare 403)
+                    $parserResponse = $client->post('https://www.tikwm.com/api/', [
+                        'form_params' => [
+                            'url'   => $cleanUrl,
+                            'count' => 12,
+                            'cursor'=> 0,
+                            'web'   => 1,
+                            'hd'    => 1,
+                        ],
+                        'headers' => [
+                            'User-Agent'      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                            'Accept'          => 'application/json, text/javascript, */*; q=0.01',
+                            'X-Requested-With'=> 'XMLHttpRequest',
+                            'Origin'          => 'https://www.tikwm.com',
+                            'Referer'         => 'https://www.tikwm.com/',
+                        ],
+                        'http_errors' => false,
+                    ]);
+
+                    $rawBody = (string)$parserResponse->getBody();
+                    $data = json_decode($rawBody, true);
+
+                    if (isset($data['code']) && $data['code'] === 0 && !empty($data['data'])) {
+                        $item = $data['data'];
+
+                        // Вариант А: Фото-карусель (слайд-шоу)
+                        if (!empty($item['images']) && is_array($item['images'])) {
+                            echo "Обнаружен альбом из " . count($item['images']) . " фото. Отправляю медиагруппой...\n";
+                            
+                            $mediaGroup = [];
+                            $photos = array_slice($item['images'], 0, 10); // Telegram принимает до 10 файлов за раз
+                            foreach ($photos as $i => $imgUrl) {
+                                $mediaGroup[] = [
+                                    'type'    => 'photo',
+                                    'media'   => $imgUrl,
+                                    'caption' => ($i === 0) ? 'Скачано через @sfayzttbot' : '',
+                                ];
+                            }
+
+                            $client->post($telegramApiUrl . 'sendMediaGroup', [
+                                'json' => [
+                                    'chat_id' => $chatId,
+                                    'media'   => $mediaGroup,
+                                ],
+                            ]);
+                            echo "Фото успешно отправлены.\n";
+                            continue;
+                        }
+
+                        // Вариант Б: Обычное видео
+                        $videoUrl = $item['play'] ?? null;
+                        if ($videoUrl) {
+                            // Если ссылка относительная, добавляем хост TikWM
+                            if (!str_starts_with($videoUrl, 'http')) {
+                                $videoUrl = 'https://www.tikwm.com' . $videoUrl;
+                            }
+
+                            echo "Отправляю видео напрямую по URL...\n";
+                            $client->post($telegramApiUrl . 'sendVideo', [
+                                'json' => [
+                                    'chat_id'            => $chatId,
+                                    'video'              => $videoUrl,
+                                    'caption'            => 'Скачано через @sfayzttbot',
+                                    'supports_streaming' => true,
+                                ],
+                            ]);
+                            echo "Видео успешно отправлено.\n";
+                            continue;
+                        }
+                    }
+
+                    echo "Не удалось получить медиа от TikWM: {$rawBody}\n";
+                    $client->post($telegramApiUrl . 'sendMessage', [
+                        'json' => [
+                            'chat_id' => $chatId,
+                            'text'    => "Не удалось скачать медиа по этой ссылке.",
+                        ],
+                    ]);
                 }
             }
         }
