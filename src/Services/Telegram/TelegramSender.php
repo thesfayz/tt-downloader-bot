@@ -43,34 +43,57 @@ final class TelegramSender implements MessageSenderInterface
 
     public function sendMediaGroup(int $chatId, array $filePaths, string $caption = ''): void
     {
-        $multipart = [
-            ['name' => 'chat_id', 'contents' => (string)$chatId],
-        ];
-        $mediaGroup = [];
+        // Telegram поддерживает альбомы размером от 2 до 10 файлов.
+        // Если фото больше 10, разбиваем на чанки по 10 штук.
+        $chunks = array_chunk($filePaths, 10);
 
-        foreach (array_slice($filePaths, 0, 10) as $idx => $path) {
-            $attachName = "file_{$idx}";
+        foreach ($chunks as $chunkIndex => $chunk) {
+            $multipart = [
+                [
+                    'name'     => 'chat_id',
+                    'contents' => (string)$chatId,
+                ],
+            ];
+
+            $mediaGroup = [];
+
+            foreach ($chunk as $idx => $filePath) {
+                $attachKey = "photo_{$chunkIndex}_{$idx}";
+
+                $multipart[] = [
+                    'name'     => $attachKey,
+                    'contents' => fopen($filePath, 'r'),
+                    'filename' => "photo_{$idx}.jpg",
+                ];
+
+                $mediaItem = [
+                    'type'  => 'photo',
+                    'media' => "attach://{$attachKey}",
+                ];
+
+                // Подпись добавляем только к первой фотографии первого альбома
+                if ($chunkIndex === 0 && $idx === 0 && $caption !== '') {
+                    $mediaItem['caption'] = $caption;
+                }
+
+                $mediaGroup[] = $mediaItem;
+            }
+
             $multipart[] = [
-                'name' => $attachName,
-                'contents' => fopen($path, 'r'),
-                'filename' => "photo_{$idx}.jpg",
+                'name'     => 'media',
+                'contents' => json_encode($mediaGroup, JSON_UNESCAPED_SLASHES),
             ];
-            $mediaGroup[] = [
-                'type' => 'photo',
-                'media' => "attach://{$attachName}",
-                'caption' => ($idx === 0) ? $caption : '',
-            ];
+
+            $response = $this->client->request('POST', $this->baseUrl . 'sendMediaGroup', [
+                'multipart'   => $multipart,
+                'http_errors' => false,
+            ]);
+
+            // Если Telegram отклонил медиагруппу — пишем в лог для отладки
+            if ($response->getStatusCode() !== 200) {
+                echo "Ошибка Telegram API при отправке альбома: " . (string)$response->getBody() . "\n";
+            }
         }
-
-        $multipart[] = [
-            'name' => 'media',
-            'contents' => json_encode($mediaGroup),
-        ];
-
-        $this->client->request('POST', $this->baseUrl . 'sendMediaGroup', [
-            'multipart' => $multipart,
-            'http_errors' => false,
-        ]);
     }
 
     public function sendVideo(int $chatId, string $filePath, string $caption = ''): void

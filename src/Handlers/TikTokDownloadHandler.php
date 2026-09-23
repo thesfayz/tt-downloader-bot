@@ -43,11 +43,21 @@ final class TikTokDownloadHandler implements HandlerInterface
         try {
             if ($result->type === MediaType::CAROUSEL) {
                 $count = count($result->filePaths);
+                echo "Найдено слайдов для отправки: {$count}\n";
+
+                if ($count === 0) {
+                    $this->sender->sendMessage($chatId, "Не удалось извлечь фото из карусели.");
+                    return;
+                }
+
                 if ($count === 1) {
+                    echo "Отправка одиночного фото...\n";
                     $this->sender->sendPhoto($chatId, $result->filePaths[0], 'Скачано через @sfayzttbot');
                 } else {
+                    echo "Отправка медиагруппы ({$count} фото)...\n";
                     $this->sender->sendMediaGroup($chatId, $result->filePaths, 'Скачано через @sfayzttbot');
                 }
+
                 echo "Карусель ({$count} фото) доставлена.\n";
             } elseif ($result->type === MediaType::VIDEO) {
                 $this->sender->sendVideo($chatId, $result->filePaths[0], 'Скачано через @sfayzttbot');
