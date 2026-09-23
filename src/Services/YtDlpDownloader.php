@@ -30,6 +30,18 @@ final class YtDlpDownloader implements MediaDownloaderInterface
         $rawJson = shell_exec($jsonCmd);
         $meta = json_decode((string)$rawJson, true);
 
+        echo "TOP KEYS: " . implode(', ', array_keys($meta ?? [])) . "\n";
+        if (!empty($meta['entries'])) {
+            echo "ENTRIES COUNT: " . count($meta['entries']) . "\n";
+            echo "ENTRY[0] KEYS: " . implode(', ', array_keys($meta['entries'][0] ?? [])) . "\n";
+        }
+        if (!empty($meta['thumbnails'])) {
+            echo "THUMBNAILS COUNT: " . count($meta['thumbnails']) . "\n";
+        }
+        if (!empty($meta['image_post_info'])) {
+            echo "IMAGE_POST_INFO FOUND\n";
+        }
+
         $hasVideo = !empty($meta['vcodec']) && $meta['vcodec'] !== 'none';
         $isPhoto = str_contains($url, '/photo/') || !$hasVideo;
 
