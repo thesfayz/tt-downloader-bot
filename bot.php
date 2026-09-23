@@ -23,7 +23,7 @@ $client = new Client([
 ]);
 
 $offset = 0;
-echo "Бот TikWM (видео + фото) запущен...\n";
+echo "Бот TikWM (зеркала) запущен...\n";
 
 while (true) {
     try {
@@ -67,7 +67,7 @@ while (true) {
                         ],
                     ]);
 
-                    // 1. Разворачиваем короткие ссылки vt/vm
+                    // 1. Разворачиваем короткие ссылки
                     if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
                         try {
                             $redirectResponse = $client->get($tiktokUrl, [
@@ -90,39 +90,55 @@ while (true) {
                     }
 
                     $cleanUrl = strtok($tiktokUrl, '?');
-                    echo "Запрос к TikWM для: {$cleanUrl}\n";
+                    echo "Запрос к парсерам для: {$cleanUrl}\n";
 
-                    // 2. Запрос к TikWM через POST form_params (обходит Cloudflare 403)
-                    $parserResponse = $client->post('https://www.tikwm.com/api/', [
-                        'form_params' => [
-                            'url'   => $cleanUrl,
-                            'count' => 12,
-                            'cursor'=> 0,
-                            'web'   => 1,
-                            'hd'    => 1,
-                        ],
-                        'headers' => [
-                            'User-Agent'      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-                            'Accept'          => 'application/json, text/javascript, */*; q=0.01',
-                            'X-Requested-With'=> 'XMLHttpRequest',
-                            'Origin'          => 'https://www.tikwm.com',
-                            'Referer'         => 'https://www.tikwm.com/',
-                        ],
-                        'http_errors' => false,
-                    ]);
+                    // Список стабильных зеркал TikWM
+                    $endpoints = [
+                        'https://api2.tikwm.com/api/',
+                        'https://tikwm.top/api/',
+                        'https://api.tikwm.com/api/',
+                    ];
 
-                    $rawBody = (string)$parserResponse->getBody();
-                    $data = json_decode($rawBody, true);
+                    $item = null;
 
-                    if (isset($data['code']) && $data['code'] === 0 && !empty($data['data'])) {
-                        $item = $data['data'];
+                    foreach ($endpoints as $endpoint) {
+                        try {
+                            $parserResponse = $client->post($endpoint, [
+                                'form_params' => [
+                                    'url'   => $cleanUrl,
+                                    'count' => 12,
+                                    'cursor'=> 0,
+                                    'web'   => 1,
+                                    'hd'    => 1,
+                                ],
+                                'headers' => [
+                                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36',
+                                    'Accept'     => 'application/json, text/plain, */*',
+                                ],
+                                'http_errors' => false,
+                                'timeout'     => 10,
+                            ]);
 
-                        // Вариант А: Фото-карусель (слайд-шоу)
+                            $rawBody = (string)$parserResponse->getBody();
+                            $data = json_decode($rawBody, true);
+
+                            if (isset($data['code']) && $data['code'] === 0 && !empty($data['data'])) {
+                                $item = $data['data'];
+                                echo "Успешный ответ от {$endpoint}\n";
+                                break;
+                            }
+                        } catch (\Throwable $e) {
+                            echo "Ошибка на {$endpoint}: " . $e->getMessage() . "\n";
+                        }
+                    }
+
+                    if ($item) {
+                        // 1. Если это карусель фото
                         if (!empty($item['images']) && is_array($item['images'])) {
-                            echo "Обнаружен альбом из " . count($item['images']) . " фото. Отправляю медиагруппой...\n";
+                            echo "Карусель из " . count($item['images']) . " фото. Отправка...\n";
                             
                             $mediaGroup = [];
-                            $photos = array_slice($item['images'], 0, 10); // Telegram принимает до 10 файлов за раз
+                            $photos = array_slice($item['images'], 0, 10);
                             foreach ($photos as $i => $imgUrl) {
                                 $mediaGroup[] = [
                                     'type'    => 'photo',
@@ -137,19 +153,18 @@ while (true) {
                                     'media'   => $mediaGroup,
                                 ],
                             ]);
-                            echo "Фото успешно отправлены.\n";
+                            echo "Фото отправлены.\n";
                             continue;
                         }
 
-                        // Вариант Б: Обычное видео
+                        // 2. Если это видео
                         $videoUrl = $item['play'] ?? null;
                         if ($videoUrl) {
-                            // Если ссылка относительная, добавляем хост TikWM
                             if (!str_starts_with($videoUrl, 'http')) {
-                                $videoUrl = 'https://www.tikwm.com' . $videoUrl;
+                                $videoUrl = 'https://tikwm.com' . $videoUrl;
                             }
 
-                            echo "Отправляю видео напрямую по URL...\n";
+                            echo "Отправка видео...\n";
                             $client->post($telegramApiUrl . 'sendVideo', [
                                 'json' => [
                                     'chat_id'            => $chatId,
@@ -158,12 +173,11 @@ while (true) {
                                     'supports_streaming' => true,
                                 ],
                             ]);
-                            echo "Видео успешно отправлено.\n";
+                            echo "Видео отправлено.\n";
                             continue;
                         }
                     }
 
-                    echo "Не удалось получить медиа от TikWM: {$rawBody}\n";
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
