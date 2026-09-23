@@ -24,7 +24,7 @@ $client = new Client([
 ]);
 
 $offset = 0;
-echo "Бот yt-dlp (полноценные фотопосты + видео) запущен...\n";
+echo "Бот запущен...\n";
 
 while (true) {
     try {
@@ -58,7 +58,7 @@ while (true) {
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
-                            'text'    => "Отправь ссылку на TikTok (видео или фото-карусель), и я скачаю всё без водяного знака.",
+                            'text'    => "Отправь ссылку на TikTok, и я пришлю всё без водяного знака.",
                         ],
                     ]);
                     continue;
@@ -74,82 +74,91 @@ while (true) {
                         ],
                     ]);
 
-                    // Разворачиваем короткие ссылки
+                    // Разворачиваем ссылки
                     if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
                         try {
                             $redirectResponse = $client->get($tiktokUrl, [
-                                'allow_redirects' => [
-                                    'max'             => 10,
-                                    'track_redirects' => true,
-                                ],
-                                'headers' => [
-                                    'User-Agent' => 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
-                                ],
+                                'allow_redirects' => ['max' => 10, 'track_redirects' => true],
+                                'headers' => ['User-Agent' => 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)'],
                             ]);
-
                             $history = $redirectResponse->getHeader('X-Guzzle-Redirect-History');
                             if (!empty($history)) {
                                 $tiktokUrl = end($history);
                             }
-                        } catch (\Throwable $e) {
-                            echo "Ошибка редиректа: " . $e->getMessage() . "\n";
-                        }
+                        } catch (\Throwable $e) {}
                     }
 
-                    // Извлекаем ID
                     preg_match('/[\/](video|photo)[\/](\d+)/', $tiktokUrl, $idMatches);
                     $mediaId = $idMatches[2] ?? null;
-
                     $targetUrl = $mediaId ? "https://www.tiktok.com/@i/video/{$mediaId}" : strtok($tiktokUrl, '?');
                     $targetUrl = str_replace(' ', '%20', $targetUrl);
 
-                    echo "Получение метаданных: {$targetUrl}\n";
+                    echo "Анализ медиа: {$targetUrl}\n";
 
-                    // 1. Получаем JSON с информацией о посте
+                    // 1. Получаем JSON метаданных
                     $dumpCmd = sprintf(
                         'yt-dlp -J --no-warnings --socket-timeout 20 %s 2>&1',
                         escapeshellarg($targetUrl)
                     );
-
                     $jsonRaw = shell_exec($dumpCmd);
                     $info = json_decode($jsonRaw, true);
 
-                    // Проверяем наличие картинок слайдшоу в thumbnails
-                    $slideImages = [];
-                    if (!empty($info['thumbnails']) && is_array($info['thumbnails'])) {
-                        foreach ($info['thumbnails'] as $t) {
-                            // Ищем именно кадры слайдшоу (обычно id = image_0, image_1...)
-                            if (isset($t['id']) && str_starts_with($t['id'], 'image_') && !empty($t['url'])) {
-                                $slideImages[] = $t['url'];
+                    // 2. Ищем картинки фото-карусели
+                    $photos = [];
+
+                    // А) Если это плейлист слайдов в entries
+                    if (!empty($info['entries']) && is_array($info['entries'])) {
+                        foreach ($info['entries'] as $entry) {
+                            if (!empty($entry['url'])) {
+                                $photos[] = $entry['url'];
                             }
                         }
                     }
 
-                    // Если картинок слайдшоу больше одной — это фотопост!
-                    if (!empty($slideImages)) {
-                        echo "Найдено " . count($slideImages) . " слайдов фото. Скачиваю...\n";
-                        $tempDir = sys_get_temp_dir() . '/' . uniqid('tt_img_');
+                    // Б) Если картинки лежат в thumbnails самого объекта
+                    if (empty($photos) && !empty($info['thumbnails']) && is_array($info['thumbnails'])) {
+                        foreach ($info['thumbnails'] as $t) {
+                            // Берем только уникальные полные фото поста
+                            if (isset($t['id']) && preg_match('/^(image_\d+|preview_\d+)$/', $t['id']) && !empty($t['url'])) {
+                                $photos[] = $t['url'];
+                            }
+                        }
+                    }
+
+                    // В) Если в formats лежат только аудио или duration == 0, но есть список thumbnails
+                    $isVideo = !empty($info['duration']) && $info['duration'] > 0;
+                    if (!$isVideo && empty($photos) && !empty($info['thumbnails'])) {
+                        foreach ($info['thumbnails'] as $t) {
+                            if (!empty($t['url']) && !str_contains($t['url'], 'avatar')) {
+                                $photos[] = $t['url'];
+                            }
+                        }
+                        $photos = array_unique($photos);
+                    }
+
+                    // 3. ОТПРАВКА ФОТО (если найдены картинки или это не видео)
+                    if (!empty($photos) && (!$isVideo || count($photos) > 1)) {
+                        echo "Найдено " . count($photos) . " картинок. Скачиваю для отправки...\n";
+                        $tempDir = sys_get_temp_dir() . '/' . uniqid('tt_pics_');
                         @mkdir($tempDir, 0777, true);
 
-                        $downloadedFiles = [];
-                        foreach (array_slice($slideImages, 0, 10) as $idx => $imgUrl) {
-                            $filePath = "{$tempDir}/photo_{$idx}.jpg";
+                        $downloaded = [];
+                        foreach (array_slice($photos, 0, 10) as $i => $imgUrl) {
+                            $filePath = "{$tempDir}/p_{$i}.jpg";
                             try {
                                 $client->get($imgUrl, ['sink' => $filePath, 'timeout' => 10]);
                                 if (file_exists($filePath) && filesize($filePath) > 1000) {
-                                    $downloadedFiles[] = $filePath;
+                                    $downloaded[] = $filePath;
                                 }
                             } catch (\Throwable $e) {}
                         }
 
-                        if (!empty($downloadedFiles)) {
-                            echo "Отправляю " . count($downloadedFiles) . " фото в чат...\n";
-
-                            if (count($downloadedFiles) === 1) {
+                        if (!empty($downloaded)) {
+                            if (count($downloaded) === 1) {
                                 $client->post($telegramApiUrl . 'sendPhoto', [
                                     'multipart' => [
                                         ['name' => 'chat_id', 'contents' => (string)$chatId],
-                                        ['name' => 'photo',   'contents' => fopen($downloadedFiles[0], 'r'), 'filename' => 'photo.jpg'],
+                                        ['name' => 'photo',   'contents' => fopen($downloaded[0], 'r'), 'filename' => 'photo.jpg'],
                                         ['name' => 'caption', 'contents' => 'Скачано через @sfayzttbot'],
                                     ],
                                 ]);
@@ -159,12 +168,12 @@ while (true) {
                                     ['name' => 'chat_id', 'contents' => (string)$chatId],
                                 ];
 
-                                foreach ($downloadedFiles as $i => $path) {
-                                    $attachName = "photo_{$i}";
+                                foreach ($downloaded as $i => $path) {
+                                    $attachName = "file_{$i}";
                                     $multipart[] = [
                                         'name'     => $attachName,
                                         'contents' => fopen($path, 'r'),
-                                        'filename' => "photo_{$i}.jpg",
+                                        'filename' => "p_{$i}.jpg",
                                     ];
                                     $mediaGroup[] = [
                                         'type'    => 'photo',
@@ -185,7 +194,7 @@ while (true) {
 
                             array_map('unlink', glob("{$tempDir}/*"));
                             @rmdir($tempDir);
-                            echo "Фотографии успешно отправлены.\n";
+                            echo "Фотографии отправлены.\n";
                             continue;
                         }
 
@@ -193,22 +202,23 @@ while (true) {
                         @rmdir($tempDir);
                     }
 
-                    // 2. Если это видеопост — скачиваем полноценное MP4
+                    // 4. ОТПРАВКА НАСТОЯЩЕГО ВИДЕО
                     $tempDir = sys_get_temp_dir();
                     $filePrefix = uniqid('tt_vid_');
                     $videoPath = "{$tempDir}/{$filePrefix}.mp4";
 
+                    // Требуем именно видеопоток (-f "bv*+ba/b"), чтобы не качать пустые m4a
                     $dlCmd = sprintf(
-                        'yt-dlp --no-warnings -f "bv*+ba/b" --merge-output-format mp4 -o %s %s 2>&1',
+                        'yt-dlp --no-warnings -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best" --merge-output-format mp4 -o %s %s 2>&1',
                         escapeshellarg($videoPath),
                         escapeshellarg($targetUrl)
                     );
 
-                    echo "Скачивание видео через yt-dlp...\n";
+                    echo "Скачивание видеопотока...\n";
                     exec($dlCmd, $dlOut, $dlCode);
 
-                    if (file_exists($videoPath) && filesize($videoPath) > 5000) {
-                        echo "Видео скачано. Отправляю в Telegram...\n";
+                    if (file_exists($videoPath) && filesize($videoPath) > 50000) {
+                        echo "Видео скачано (" . filesize($videoPath) . " байт). Отправляю...\n";
                         $client->post($telegramApiUrl . 'sendVideo', [
                             'multipart' => [
                                 ['name' => 'chat_id',            'contents' => (string)$chatId],
@@ -227,7 +237,7 @@ while (true) {
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
-                            'text'    => "Не удалось скачать медиа по этой ссылке.",
+                            'text'    => "Не удалось загрузить медиа по этой ссылке.",
                         ],
                     ]);
                 }
