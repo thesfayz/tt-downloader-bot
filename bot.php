@@ -23,7 +23,7 @@ $client = new Client([
 ]);
 
 $offset = 0;
-echo "Бот на базе yt-dlp запущен...\n";
+echo "Бот запущен...\n";
 
 while (true) {
     try {
@@ -63,7 +63,7 @@ while (true) {
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
-                            'text'    => "Скачиваю через yt-dlp, подожди немного...",
+                            'text'    => "Скачиваю без водяного знака, подожди немного...",
                         ],
                     ]);
 
@@ -77,7 +77,7 @@ while (true) {
                         escapeshellarg($tiktokUrl)
                     );
 
-                    echo "Выполняю команду yt-dlp...\n";
+                    echo "Выполняю команду...\n";
                     exec($cmd, $output, $returnCode);
 
                     if ($returnCode === 0 && file_exists($outputPath)) {
@@ -108,7 +108,7 @@ while (true) {
                         $client->post($telegramApiUrl . 'sendMessage', [
                             'json' => [
                                 'chat_id' => $chatId,
-                                'text'    => "Не удалось скачать видео через yt-dlp.",
+                                'text'    => "Не удалось скачать видео через.",
                             ],
                         ]);
                     }
