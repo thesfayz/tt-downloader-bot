@@ -24,7 +24,7 @@ $client = new Client([
 ]);
 
 $offset = 0;
-echo "Бот запущен...\n";
+echo "Бот запущен (карусель всех фото + видео)...\n";
 
 while (true) {
     try {
@@ -58,7 +58,7 @@ while (true) {
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
-                            'text'    => "Отправь ссылку на TikTok (видео или фото-карусель), и я пришлю всё без водяного знака.",
+                            'text'    => "Отправь ссылку на TikTok (видео или фото-карусель), и я скачаю всё без водяного знака.",
                         ],
                     ]);
                     continue;
@@ -88,7 +88,6 @@ while (true) {
                         } catch (\Throwable $e) {}
                     }
 
-                    // Нормализуем URL
                     preg_match('/[\/](video|photo)[\/](\d+)/', $tiktokUrl, $idMatches);
                     $mediaType = $idMatches[1] ?? 'video';
                     $mediaId   = $idMatches[2] ?? null;
@@ -101,85 +100,108 @@ while (true) {
                     $tempDir = sys_get_temp_dir() . '/' . uniqid('tt_');
                     @mkdir($tempDir, 0777, true);
 
-                    // 1. ФОТОПОСТ
+                    // 1. ПРОВЕРКА И СКАЧИВАНИЕ ФОТО-КАРУСЕЛИ
                     if ($mediaType === 'photo' || str_contains($tiktokUrl, '/photo/')) {
-                        echo "Скачивание фото-слайдов через yt-dlp...\n";
-                        
-                        $imgPattern = "{$tempDir}/img_%(autonumber)02d.%(ext)s";
-                        $cmd = sprintf(
-                            'yt-dlp --no-warnings --write-all-thumbnails --skip-download -o %s %s 2>&1',
-                            escapeshellarg($imgPattern),
+                        echo "Получение списка всех фото через JSON...\n";
+
+                        $jsonCmd = sprintf(
+                            'yt-dlp -J --no-warnings --socket-timeout 20 %s 2>&1',
                             escapeshellarg($targetUrl)
                         );
-                        exec($cmd);
+                        $jsonRaw = shell_exec($jsonCmd);
+                        $meta = json_decode($jsonRaw, true);
 
-                        // Чтение файлов без GLOB_BRACE (совместимо со всеми ОС)
-                        $allFiles = scandir($tempDir) ?: [];
-                        $validImages = [];
+                        $slideUrls = [];
 
-                        foreach ($allFiles as $f) {
-                            if ($f === '.' || $f === '..') continue;
-                            $fullPath = "{$tempDir}/{$f}";
-                            $ext = strtolower(pathinfo($fullPath, PATHINFO_EXTENSION));
-
-                            if (in_array($ext, ['jpg', 'jpeg', 'png', 'webp'])) {
-                                if (filesize($fullPath) > 10000) {
-                                    $validImages[] = $fullPath;
+                        // Если пост — карусель, yt-dlp кладёт слайды в entries
+                        if (!empty($meta['entries']) && is_array($meta['entries'])) {
+                            foreach ($meta['entries'] as $entry) {
+                                if (!empty($entry['url'])) {
+                                    $slideUrls[] = $entry['url'];
+                                } elseif (!empty($entry['thumbnails'])) {
+                                    $lastThumb = end($entry['thumbnails']);
+                                    if (!empty($lastThumb['url'])) {
+                                        $slideUrls[] = $lastThumb['url'];
+                                    }
                                 }
                             }
                         }
 
-                        sort($validImages);
-
-                        if (!empty($validImages)) {
-                            if (count($validImages) === 1) {
-                                echo "Отправка 1 фото...\n";
-                                $client->post($telegramApiUrl . 'sendPhoto', [
-                                    'multipart' => [
-                                        ['name' => 'chat_id', 'contents' => (string)$chatId],
-                                        ['name' => 'photo',   'contents' => fopen($validImages[0], 'r'), 'filename' => 'photo.jpg'],
-                                        ['name' => 'caption', 'contents' => 'Скачано через @sfayzttbot'],
-                                    ],
-                                ]);
-                            } else {
-                                echo "Отправка карусели из " . count($validImages) . " фото...\n";
-                                $mediaGroup = [];
-                                $multipart = [
-                                    ['name' => 'chat_id', 'contents' => (string)$chatId],
-                                ];
-
-                                foreach (array_slice($validImages, 0, 10) as $i => $path) {
-                                    $attachName = "photo_{$i}";
-                                    $multipart[] = [
-                                        'name'     => $attachName,
-                                        'contents' => fopen($path, 'r'),
-                                        'filename' => "photo_{$i}.jpg",
-                                    ];
-                                    $mediaGroup[] = [
-                                        'type'    => 'photo',
-                                        'media'   => "attach://{$attachName}",
-                                        'caption' => ($i === 0) ? 'Скачано через @sfayzttbot' : '',
-                                    ];
+                        // Запасной поиск слайдов в основном thumbnails (id: image_0, image_1...)
+                        if (empty($slideUrls) && !empty($meta['thumbnails'])) {
+                            foreach ($meta['thumbnails'] as $t) {
+                                if (!empty($t['url']) && !str_contains($t['url'], 'avatar')) {
+                                    $slideUrls[] = $t['url'];
                                 }
+                            }
+                        }
 
-                                $multipart[] = [
-                                    'name'     => 'media',
-                                    'contents' => json_encode($mediaGroup),
-                                ];
+                        $slideUrls = array_values(array_unique($slideUrls));
 
-                                $client->post($telegramApiUrl . 'sendMediaGroup', [
-                                    'multipart' => $multipart,
-                                ]);
+                        if (!empty($slideUrls)) {
+                            echo "Найдено " . count($slideUrls) . " уникальных фото. Скачиваю...\n";
+
+                            $downloadedFiles = [];
+                            foreach (array_slice($slideUrls, 0, 10) as $i => $imgUrl) {
+                                $filePath = "{$tempDir}/slide_{$i}.jpg";
+                                try {
+                                    $client->get($imgUrl, ['sink' => $filePath, 'timeout' => 15]);
+                                    if (file_exists($filePath) && filesize($filePath) > 2000) {
+                                        $downloadedFiles[] = $filePath;
+                                    }
+                                } catch (\Throwable $e) {}
                             }
 
-                            array_map('unlink', glob("{$tempDir}/*") ?: []);
-                            @rmdir($tempDir);
-                            echo "Фото доставлены.\n";
-                            continue;
+                            if (!empty($downloadedFiles)) {
+                                if (count($downloadedFiles) === 1) {
+                                    echo "Отправка 1 фото...\n";
+                                    $client->post($telegramApiUrl . 'sendPhoto', [
+                                        'multipart' => [
+                                            ['name' => 'chat_id', 'contents' => (string)$chatId],
+                                            ['name' => 'photo',   'contents' => fopen($downloadedFiles[0], 'r'), 'filename' => 'photo.jpg'],
+                                            ['name' => 'caption', 'contents' => 'Скачано через @sfayzttbot'],
+                                        ],
+                                    ]);
+                                } else {
+                                    echo "Отправка альбома из " . count($downloadedFiles) . " фото...\n";
+                                    $mediaGroup = [];
+                                    $multipart = [
+                                        ['name' => 'chat_id', 'contents' => (string)$chatId],
+                                    ];
+
+                                    foreach ($downloadedFiles as $i => $path) {
+                                        $attachName = "photo_{$i}";
+                                        $multipart[] = [
+                                            'name'     => $attachName,
+                                            'contents' => fopen($path, 'r'),
+                                            'filename' => "slide_{$i}.jpg",
+                                        ];
+                                        $mediaGroup[] = [
+                                            'type'    => 'photo',
+                                            'media'   => "attach://{$attachName}",
+                                            'caption' => ($i === 0) ? 'Скачано через @sfayzttbot' : '',
+                                        ];
+                                    }
+
+                                    $multipart[] = [
+                                        'name'     => 'media',
+                                        'contents' => json_encode($mediaGroup),
+                                    ];
+
+                                    $client->post($telegramApiUrl . 'sendMediaGroup', [
+                                        'multipart' => $multipart,
+                                    ]);
+                                }
+
+                                array_map('unlink', glob("{$tempDir}/*") ?: []);
+                                @rmdir($tempDir);
+                                echo "Все фото доставлены.\n";
+                                continue;
+                            }
                         }
                     }
 
-                    // 2. ВИДЕОПОСТ
+                    // 2. СКАЧИВАНИЕ ВИДЕО (если это не карусель)
                     echo "Скачивание видео через yt-dlp...\n";
                     $videoPath = "{$tempDir}/video.mp4";
 
