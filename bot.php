@@ -16,15 +16,16 @@ if (!$botToken) {
 }
 
 $telegramApiUrl = "https://api.telegram.org/bot{$botToken}/";
+$workerUrl = "https://tikwm-proxy.sfayzullaev007.workers.dev/";
 
 $client = new Client([
-    'timeout'         => 30.0,
+    'timeout'         => 60.0,
     'allow_redirects' => true,
     'verify'          => false,
 ]);
 
 $offset = 0;
-echo "Бот запущен на прямом бесплатном API...\n";
+echo "Бот (Worker + Прямой стрим) запущен...\n";
 
 while (true) {
     try {
@@ -37,8 +38,7 @@ while (true) {
         ]);
 
         if ($updatesResponse->getStatusCode() === 409) {
-            // Если предыдущий контейнер Render еще не завершился
-            sleep(3);
+            sleep(2);
             continue;
         }
 
@@ -71,11 +71,11 @@ while (true) {
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
-                            'text'    => "Загружаю без водяного знака...",
+                            'text'    => "Загружаю медиа без водяного знака...",
                         ],
                     ]);
 
-                    // Разворачиваем короткие ссылки vt/vm
+                    // Разворачиваем vt/vm ссылки
                     if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
                         try {
                             $redirectResponse = $client->get($tiktokUrl, [
@@ -97,61 +97,25 @@ while (true) {
                         }
                     }
 
-                    preg_match('/\/video\/(\d+)/', $tiktokUrl, $idMatches);
-                    $cleanUrl = isset($idMatches[1]) ? "https://www.tiktok.com/@i/video/{$idMatches[1]}" : strtok($tiktokUrl, '?');
+                    $cleanUrl = strtok($tiktokUrl, '?');
+                    echo "Запрос к воркеру для: {$cleanUrl}\n";
 
-                    echo "Парсинг URL: {$cleanUrl}\n";
+                    $res = $client->get($workerUrl, [
+                        'query'       => ['url' => $cleanUrl],
+                        'http_errors' => false,
+                        'timeout'     => 15,
+                    ]);
 
-                    $mediaData = null;
+                    $data = json_decode((string)$res->getBody(), true);
 
-                    // Вариант 1: Прямой запрос к Lovetik (открытый API без ограничений Render)
-                    try {
-                        $res = $client->post('https://lovetik.com/api/ajax/search', [
-                            'form_params' => ['query' => $cleanUrl],
-                            'headers' => [
-                                'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36',
-                                'Accept'     => 'application/json',
-                            ],
-                            'timeout' => 12,
-                        ]);
+                    if (isset($data['code']) && $data['code'] === 0 && !empty($data['data'])) {
+                        $item = $data['data'];
 
-                        $json = json_decode((string)$res->getBody(), true);
-
-                        if (!empty($json['images']) && is_array($json['images'])) {
-                            $mediaData = [
-                                'type'   => 'photos',
-                                'images' => $json['images'],
-                            ];
-                        } elseif (!empty($json['links'])) {
-                            $videoUrl = null;
-                            foreach ($json['links'] as $link) {
-                                if (!empty($link['a']) && empty($link['watermark'])) {
-                                    $videoUrl = $link['a'];
-                                    break;
-                                }
-                            }
-                            if (!$videoUrl && !empty($json['links'][0]['a'])) {
-                                $videoUrl = $json['links'][0]['a'];
-                            }
-
-                            if ($videoUrl) {
-                                $mediaData = [
-                                    'type'  => 'video',
-                                    'video' => $videoUrl,
-                                ];
-                            }
-                        }
-                    } catch (\Throwable $e) {
-                        echo "Ошибка первичного API: " . $e->getMessage() . "\n";
-                    }
-
-                    // Отправка в Telegram
-                    if ($mediaData) {
-                        // Карусель картинок
-                        if ($mediaData['type'] === 'photos' && !empty($mediaData['images'])) {
-                            echo "Карусель из " . count($mediaData['images']) . " фото. Отправляю...\n";
+                        // 1. Если это фото-карусель
+                        if (!empty($item['images']) && is_array($item['images'])) {
+                            echo "Карусель из " . count($item['images']) . " фото. Отправка...\n";
                             $mediaGroup = [];
-                            $photos = array_slice($mediaData['images'], 0, 10);
+                            $photos = array_slice($item['images'], 0, 10);
                             foreach ($photos as $i => $imgUrl) {
                                 $mediaGroup[] = [
                                     'type'    => 'photo',
@@ -170,23 +134,59 @@ while (true) {
                             continue;
                         }
 
-                        // Видеофайл
-                        if ($mediaData['type'] === 'video' && !empty($mediaData['video'])) {
-                            echo "Отправка видео напрямую в Telegram...\n";
-                            $client->post($telegramApiUrl . 'sendVideo', [
-                                'json' => [
-                                    'chat_id'            => $chatId,
-                                    'video'              => $mediaData['video'],
-                                    'caption'            => 'Скачано через @sfayzttbot',
-                                    'supports_streaming' => true,
-                                ],
-                            ]);
-                            echo "Видео успешно доставлено.\n";
-                            continue;
+                        // 2. Если это видео: качаем его на Render с Referer и сразу шлём в TG
+                        $videoUrl = $item['play'] ?? null;
+                        if ($videoUrl) {
+                            echo "Скачивание видео с CDN TikTok...\n";
+                            $tempFile = tempnam(sys_get_temp_dir(), 'tt_vid_');
+
+                            $dlSuccess = false;
+                            try {
+                                $client->get($videoUrl, [
+                                    'sink'    => $tempFile,
+                                    'headers' => [
+                                        'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                                        'Referer'    => 'https://www.tiktok.com/',
+                                    ],
+                                    'timeout' => 30,
+                                ]);
+                                $dlSuccess = (file_exists($tempFile) && filesize($tempFile) > 1000);
+                            } catch (\Throwable $dlErr) {
+                                echo "Ошибка при скачивании файла: " . $dlErr->getMessage() . "\n";
+                            }
+
+                            if ($dlSuccess) {
+                                echo "Видео скачано (" . filesize($tempFile) . " байт). Отправляю в Telegram...\n";
+                                $client->post($telegramApiUrl . 'sendVideo', [
+                                    'multipart' => [
+                                        [
+                                            'name'     => 'chat_id',
+                                            'contents' => (string)$chatId,
+                                        ],
+                                        [
+                                            'name'     => 'video',
+                                            'contents' => fopen($tempFile, 'r'),
+                                            'filename' => 'video.mp4',
+                                        ],
+                                        [
+                                            'name'     => 'caption',
+                                            'contents' => 'Скачано через @sfayzttbot',
+                                        ],
+                                        [
+                                            'name'     => 'supports_streaming',
+                                            'contents' => 'true',
+                                        ],
+                                    ],
+                                ]);
+                                @unlink($tempFile);
+                                echo "Видео успешно доставлено.\n";
+                                continue;
+                            } else {
+                                @unlink($tempFile);
+                            }
                         }
                     }
 
-                    echo "Не удалось получить ссылки от API\n";
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
