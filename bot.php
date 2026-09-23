@@ -58,7 +58,7 @@ while (true) {
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
-                            'text'    => "Отправь ссылку на TikTok (видео или фото-карусель), и я скачаю всё без водяного знака.",
+                            'text'    => "Отправь ссылку на TikTok, и я пришлю всё без водяного знака.",
                         ],
                     ]);
                     continue;
@@ -74,7 +74,7 @@ while (true) {
                         ],
                     ]);
 
-                    // Разворачиваем короткие ссылки
+                    // Разворачиваем короткие ссылки vt/vm
                     if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
                         try {
                             $redirectRes = $client->get($tiktokUrl, [
@@ -100,53 +100,73 @@ while (true) {
                     $tempDir = sys_get_temp_dir() . '/' . uniqid('tt_');
                     @mkdir($tempDir, 0777, true);
 
-                    // 1. ПРОВЕРКА И СКАЧИВАНИЕ ФОТО-КАРУСЕЛИ
+                    // 1. ПРОВЕРКА И ИЗВЛЕЧЕНИЕ КАРУСЕЛИ
                     if ($mediaType === 'photo' || str_contains($tiktokUrl, '/photo/')) {
-                        echo "Получение списка всех фото через JSON...\n";
+                        echo "Сбор слайдов карусели...\n";
 
-                        $jsonCmd = sprintf(
+                        // Вытаскиваем полный JSON
+                        $dumpCmd = sprintf(
                             'yt-dlp -J --no-warnings --socket-timeout 20 %s 2>&1',
                             escapeshellarg($targetUrl)
                         );
-                        $jsonRaw = shell_exec($jsonCmd);
+                        $jsonRaw = shell_exec($dumpCmd);
                         $meta = json_decode($jsonRaw, true);
 
-                        $slideUrls = [];
+                        $slideMap = [];
 
-                        // Если пост — карусель, yt-dlp кладёт слайды в entries
+                        // Вариант А: Проверяем entries (если yt-dlp распознал как multi-item)
                         if (!empty($meta['entries']) && is_array($meta['entries'])) {
-                            foreach ($meta['entries'] as $entry) {
+                            foreach ($meta['entries'] as $idx => $entry) {
                                 if (!empty($entry['url'])) {
-                                    $slideUrls[] = $entry['url'];
+                                    $slideMap[$idx] = $entry['url'];
                                 } elseif (!empty($entry['thumbnails'])) {
-                                    $lastThumb = end($entry['thumbnails']);
-                                    if (!empty($lastThumb['url'])) {
-                                        $slideUrls[] = $lastThumb['url'];
+                                    $best = end($entry['thumbnails']);
+                                    if (!empty($best['url'])) {
+                                        $slideMap[$idx] = $best['url'];
                                     }
                                 }
                             }
                         }
 
-                        // Запасной поиск слайдов в основном thumbnails (id: image_0, image_1...)
-                        if (empty($slideUrls) && !empty($meta['thumbnails'])) {
+                        // Вариант Б: Проверяем thumbnails (где лежат слайды поста)
+                        if (empty($slideMap) && !empty($meta['thumbnails']) && is_array($meta['thumbnails'])) {
                             foreach ($meta['thumbnails'] as $t) {
-                                if (!empty($t['url']) && !str_contains($t['url'], 'avatar')) {
-                                    $slideUrls[] = $t['url'];
+                                if (empty($t['url']) || str_contains($t['url'], 'avatar')) {
+                                    continue;
+                                }
+
+                                $tid = $t['id'] ?? '';
+                                // В TikTok слайды имеют ID вида: image_0, image_1, 0, 1 или группируются по индексу
+                                if (preg_match('/(?:image_|^)(\d+)/', $tid, $m)) {
+                                    $idx = (int)$m[1];
+                                    // Сохраняем (каждая последующая запись с тем же индексом обычно большего разрешения)
+                                    $slideMap[$idx] = $t['url'];
+                                } else {
+                                    // Если явного ID нет, группируем по уникальному пути URL (без query params)
+                                    $cleanImgPath = strtok($t['url'], '?');
+                                    $slideMap[$cleanImgPath] = $t['url'];
                                 }
                             }
                         }
 
-                        $slideUrls = array_values(array_unique($slideUrls));
+                        $slideUrls = array_values($slideMap);
 
                         if (!empty($slideUrls)) {
-                            echo "Найдено " . count($slideUrls) . " уникальных фото. Скачиваю...\n";
+                            echo "Найдено " . count($slideUrls) . " слайдов. Начинаю скачивание...\n";
 
                             $downloadedFiles = [];
                             foreach (array_slice($slideUrls, 0, 10) as $i => $imgUrl) {
                                 $filePath = "{$tempDir}/slide_{$i}.jpg";
                                 try {
-                                    $client->get($imgUrl, ['sink' => $filePath, 'timeout' => 15]);
-                                    if (file_exists($filePath) && filesize($filePath) > 2000) {
+                                    $client->get($imgUrl, [
+                                        'sink'    => $filePath,
+                                        'timeout' => 15,
+                                        'headers' => [
+                                            'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                                            'Referer'    => 'https://www.tiktok.com/',
+                                        ],
+                                    ]);
+                                    if (file_exists($filePath) && filesize($filePath) > 3000) {
                                         $downloadedFiles[] = $filePath;
                                     }
                                 } catch (\Throwable $e) {}
@@ -154,7 +174,7 @@ while (true) {
 
                             if (!empty($downloadedFiles)) {
                                 if (count($downloadedFiles) === 1) {
-                                    echo "Отправка 1 фото...\n";
+                                    echo "Отправка одиночного фото...\n";
                                     $client->post($telegramApiUrl . 'sendPhoto', [
                                         'multipart' => [
                                             ['name' => 'chat_id', 'contents' => (string)$chatId],
@@ -163,7 +183,7 @@ while (true) {
                                         ],
                                     ]);
                                 } else {
-                                    echo "Отправка альбома из " . count($downloadedFiles) . " фото...\n";
+                                    echo "Отправка альбома из " . count($downloadedFiles) . " слайдов в Telegram...\n";
                                     $mediaGroup = [];
                                     $multipart = [
                                         ['name' => 'chat_id', 'contents' => (string)$chatId],
@@ -195,13 +215,16 @@ while (true) {
 
                                 array_map('unlink', glob("{$tempDir}/*") ?: []);
                                 @rmdir($tempDir);
-                                echo "Все фото доставлены.\n";
+                                echo "Все фото успешно доставлены.\n";
                                 continue;
                             }
                         }
+
+                        array_map('unlink', glob("{$tempDir}/*") ?: []);
+                        @rmdir($tempDir);
                     }
 
-                    // 2. СКАЧИВАНИЕ ВИДЕО (если это не карусель)
+                    // 2. СКАЧИВАНИЕ ВИДЕО (если это обычный видеопост)
                     echo "Скачивание видео через yt-dlp...\n";
                     $videoPath = "{$tempDir}/video.mp4";
 
