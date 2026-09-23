@@ -69,7 +69,8 @@ while (true) {
     'http_errors' => false // чтобы Guzzle не крашил скрипт фатально при кодах 4xx/5xx
 ]);
 
-                $data = json_decode($parserResponse->getBody()->getContents(), true);
+                $data = json_decode($parserResponse->getBody(), true);
+                echo "TikWM response: " . json_encode($data) . PHP_EOL;
 
                 if (isset($data['data']['play'])) {
                     $videoUrl = $data['data']['play'];
