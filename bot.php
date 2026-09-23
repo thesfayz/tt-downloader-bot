@@ -54,11 +54,20 @@ while (true) {
                 ]);
 
                 $parserResponse = $client->get('https://www.tikwm.com/api/', [
-                    'query' => [
-                        'url' => $tiktokUrl,
-                        'hd'  => 1
-                    ]
-                ]);
+    'query' => [
+        'url' => $tiktokUrl,
+        'hd'  => 1
+    ],
+    'headers' => [
+        'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        'Accept' => 'application/json, text/javascript, */*; q=0.01',
+        'Accept-Language' => 'en-US,en;q=0.9',
+        'Referer' => 'https://www.tikwm.com/',
+        'Origin' => 'https://www.tikwm.com',
+        'X-Requested-With' => 'XMLHttpRequest'
+    ],
+    'http_errors' => false // чтобы Guzzle не крашил скрипт фатально при кодах 4xx/5xx
+]);
 
                 $data = json_decode($parserResponse->getBody()->getContents(), true);
 
