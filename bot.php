@@ -16,9 +16,7 @@ if (!$botToken) {
 }
 
 $telegramApiUrl = "https://api.telegram.org/bot{$botToken}/";
-
-// ВСТАВЬ СЮДА СВОЮ ССЫЛКУ НА WORKER ИЗ ШАГА 2
-$workerUrl = "https://tikwm-proxy.sfayzullaev007.workers.dev";
+$workerUrl = "https://tikwm-proxy.sfayzullaev007.workers.dev/";
 
 $client = new Client([
     'timeout'         => 30.0,
@@ -26,7 +24,7 @@ $client = new Client([
 ]);
 
 $offset = 0;
-echo "Бот через Cloudflare Worker запущен...\n";
+echo "Бот через собственный Cloudflare Worker запущен...\n";
 
 while (true) {
     try {
@@ -70,7 +68,7 @@ while (true) {
                         ],
                     ]);
 
-                    // Разворачиваем короткие ссылки
+                    // 1. Разворачиваем короткие ссылки
                     if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
                         try {
                             $redirectResponse = $client->get($tiktokUrl, [
@@ -92,30 +90,31 @@ while (true) {
                         }
                     }
 
-                    // Чистый URL
+                    // Чистый каноничный URL без пробелов и мусорных GET-параметров
                     preg_match('/\/video\/(\d+)/', $tiktokUrl, $idMatches);
                     $videoId = $idMatches[1] ?? null;
                     $cleanUrl = $videoId ? "https://www.tiktok.com/@i/video/{$videoId}" : strtok($tiktokUrl, '?');
 
-                    echo "Запрос через Cloudflare Worker для: {$cleanUrl}\n";
+                    echo "Запрос через твой Cloudflare Worker для: {$cleanUrl}\n";
 
-                    // Стучимся на свой воркер
+                    // 2. Запрос в Cloudflare Worker
                     $response = $client->get($workerUrl, [
                         'query' => [
                             'url' => $cleanUrl,
                         ],
                         'http_errors' => false,
+                        'timeout'     => 15,
                     ]);
 
-                    $body = (string)$response->getBody();
-                    $json = json_decode($body, true);
+                    $rawBody = (string)$response->getBody();
+                    $data = json_decode($rawBody, true);
 
-                    if (isset($json['code']) && $json['code'] === 0 && !empty($json['data'])) {
-                        $item = $json['data'];
+                    if (isset($data['code']) && $data['code'] === 0 && !empty($data['data'])) {
+                        $item = $data['data'];
 
-                        // 1. Если это карусель фото
+                        // ФОТО-КАРУСЕЛЬ
                         if (!empty($item['images']) && is_array($item['images'])) {
-                            echo "Карусель из " . count($item['images']) . " фото. Отправляю...\n";
+                            echo "Найдено " . count($item['images']) . " фото. Отправка в TG...\n";
                             $mediaGroup = [];
                             $photos = array_slice($item['images'], 0, 10);
                             foreach ($photos as $i => $imgUrl) {
@@ -132,18 +131,18 @@ while (true) {
                                     'media'   => $mediaGroup,
                                 ],
                             ]);
-                            echo "Фотографии отправлены.\n";
+                            echo "Фото отправлены.\n";
                             continue;
                         }
 
-                        // 2. Если это видео
+                        // ВИДЕО БЕЗ ВОДЯНОГО ЗНАКА
                         $videoUrl = $item['play'] ?? null;
                         if ($videoUrl) {
                             if (!str_starts_with($videoUrl, 'http')) {
                                 $videoUrl = 'https://www.tikwm.com' . $videoUrl;
                             }
 
-                            echo "Отправляю видео напрямую...\n";
+                            echo "Отправка видео напрямую по URL...\n";
                             $client->post($telegramApiUrl . 'sendVideo', [
                                 'json' => [
                                     'chat_id'            => $chatId,
@@ -157,18 +156,18 @@ while (true) {
                         }
                     }
 
-                    echo "Ошибка ответа от воркера: {$body}\n";
+                    echo "Ответ от воркера: {$rawBody}\n";
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
-                            'text'    => "Не удалось получить медиа по этой ссылке.",
+                            'text'    => "Не удалось скачать медиа по этой ссылке.",
                         ],
                     ]);
                 }
             }
         }
     } catch (\Throwable $e) {
-        echo "Ошибка цикла: " . $e->getMessage() . "\n";
+        echo "Ошибка: " . $e->getMessage() . "\n";
         sleep(2);
     }
 
