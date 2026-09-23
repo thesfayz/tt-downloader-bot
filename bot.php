@@ -24,7 +24,7 @@ $client = new Client([
 ]);
 
 $offset = 0;
-echo "Бот TikWM (прямой запуск) работает...\n";
+echo "Бот запущен на прямом бесплатном API...\n";
 
 while (true) {
     try {
@@ -33,7 +33,14 @@ while (true) {
                 'offset'  => $offset,
                 'timeout' => 20,
             ],
+            'http_errors' => false,
         ]);
+
+        if ($updatesResponse->getStatusCode() === 409) {
+            // Если предыдущий контейнер Render еще не завершился
+            sleep(3);
+            continue;
+        }
 
         $updates = json_decode($updatesResponse->getBody(), true);
 
@@ -52,7 +59,7 @@ while (true) {
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
-                            'text'    => "Отправь ссылку на TikTok (видео или фото-карусель), и я скачаю всё без водяного знака.",
+                            'text'    => "Отправь ссылку на TikTok (видео или фото-карусель), и я пришлю всё без водяного знака.",
                         ],
                     ]);
                     continue;
@@ -64,11 +71,11 @@ while (true) {
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
-                            'text'    => "Загружаю медиа без водяного знака...",
+                            'text'    => "Загружаю без водяного знака...",
                         ],
                     ]);
 
-                    // Разворачиваем редиректы коротких ссылок
+                    // Разворачиваем короткие ссылки vt/vm
                     if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
                         try {
                             $redirectResponse = $client->get($tiktokUrl, [
@@ -86,47 +93,65 @@ while (true) {
                                 $tiktokUrl = end($history);
                             }
                         } catch (\Throwable $e) {
-                            echo "Ошибка разворота редиректа: " . $e->getMessage() . "\n";
+                            echo "Ошибка редиректа: " . $e->getMessage() . "\n";
                         }
                     }
 
-                    // Достаем ID видео
                     preg_match('/\/video\/(\d+)/', $tiktokUrl, $idMatches);
                     $cleanUrl = isset($idMatches[1]) ? "https://www.tiktok.com/@i/video/{$idMatches[1]}" : strtok($tiktokUrl, '?');
 
-                    echo "Парсинг через TikWM шлюз: {$cleanUrl}\n";
+                    echo "Парсинг URL: {$cleanUrl}\n";
 
-                    // Запрос напрямую к TikWM через белый шлюз, чтобы обойти 403 на Render
-                    $gatewayUrl = 'https://corsproxy.io/?' . urlencode('https://www.tikwm.com/api/');
+                    $mediaData = null;
 
-                    $response = $client->post($gatewayUrl, [
-                        'form_params' => [
-                            'url'   => $cleanUrl,
-                            'count' => 12,
-                            'cursor'=> 0,
-                            'web'   => 1,
-                            'hd'    => 1,
-                        ],
-                        'headers' => [
-                            'User-Agent'      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36',
-                            'Accept'          => 'application/json, text/javascript, */*; q=0.01',
-                            'X-Requested-With'=> 'XMLHttpRequest',
-                        ],
-                        'http_errors' => false,
-                        'timeout'     => 15,
-                    ]);
+                    // Вариант 1: Прямой запрос к Lovetik (открытый API без ограничений Render)
+                    try {
+                        $res = $client->post('https://lovetik.com/api/ajax/search', [
+                            'form_params' => ['query' => $cleanUrl],
+                            'headers' => [
+                                'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36',
+                                'Accept'     => 'application/json',
+                            ],
+                            'timeout' => 12,
+                        ]);
 
-                    $rawBody = (string)$response->getBody();
-                    $data = json_decode($rawBody, true);
+                        $json = json_decode((string)$res->getBody(), true);
 
-                    if (isset($data['code']) && $data['code'] === 0 && !empty($data['data'])) {
-                        $item = $data['data'];
+                        if (!empty($json['images']) && is_array($json['images'])) {
+                            $mediaData = [
+                                'type'   => 'photos',
+                                'images' => $json['images'],
+                            ];
+                        } elseif (!empty($json['links'])) {
+                            $videoUrl = null;
+                            foreach ($json['links'] as $link) {
+                                if (!empty($link['a']) && empty($link['watermark'])) {
+                                    $videoUrl = $link['a'];
+                                    break;
+                                }
+                            }
+                            if (!$videoUrl && !empty($json['links'][0]['a'])) {
+                                $videoUrl = $json['links'][0]['a'];
+                            }
 
-                        // 1. Если это карусель картинок
-                        if (!empty($item['images']) && is_array($item['images'])) {
-                            echo "Карусель из " . count($item['images']) . " фото. Отправляю...\n";
+                            if ($videoUrl) {
+                                $mediaData = [
+                                    'type'  => 'video',
+                                    'video' => $videoUrl,
+                                ];
+                            }
+                        }
+                    } catch (\Throwable $e) {
+                        echo "Ошибка первичного API: " . $e->getMessage() . "\n";
+                    }
+
+                    // Отправка в Telegram
+                    if ($mediaData) {
+                        // Карусель картинок
+                        if ($mediaData['type'] === 'photos' && !empty($mediaData['images'])) {
+                            echo "Карусель из " . count($mediaData['images']) . " фото. Отправляю...\n";
                             $mediaGroup = [];
-                            $photos = array_slice($item['images'], 0, 10);
+                            $photos = array_slice($mediaData['images'], 0, 10);
                             foreach ($photos as $i => $imgUrl) {
                                 $mediaGroup[] = [
                                     'type'    => 'photo',
@@ -145,28 +170,23 @@ while (true) {
                             continue;
                         }
 
-                        // 2. Если это обычное видео
-                        $videoUrl = $item['play'] ?? null;
-                        if ($videoUrl) {
-                            if (!str_starts_with($videoUrl, 'http')) {
-                                $videoUrl = 'https://www.tikwm.com' . $videoUrl;
-                            }
-
-                            echo "Отправляю видео напрямую через CDN TikWM...\n";
+                        // Видеофайл
+                        if ($mediaData['type'] === 'video' && !empty($mediaData['video'])) {
+                            echo "Отправка видео напрямую в Telegram...\n";
                             $client->post($telegramApiUrl . 'sendVideo', [
                                 'json' => [
                                     'chat_id'            => $chatId,
-                                    'video'              => $videoUrl,
+                                    'video'              => $mediaData['video'],
                                     'caption'            => 'Скачано через @sfayzttbot',
                                     'supports_streaming' => true,
                                 ],
                             ]);
-                            echo "Видео успешно отправлено.\n";
+                            echo "Видео успешно доставлено.\n";
                             continue;
                         }
                     }
 
-                    echo "Ответ от парсера: {$rawBody}\n";
+                    echo "Не удалось получить ссылки от API\n";
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
@@ -177,7 +197,7 @@ while (true) {
             }
         }
     } catch (\Throwable $e) {
-        echo "Ошибка: " . $e->getMessage() . "\n";
+        echo "Ошибка в цикле: " . $e->getMessage() . "\n";
         sleep(2);
     }
 
