@@ -30,6 +30,16 @@ final class YtDlpDownloader implements MediaDownloaderInterface
         $rawJson = shell_exec($jsonCmd);
         $meta = json_decode((string)$rawJson, true);
 
+        $formats = $meta['formats'] ?? [];
+echo "FORMATS COUNT: " . count($formats) . "\n";
+foreach ($formats as $i => $f) {
+    $vcodec = $f['vcodec'] ?? 'n/a';
+    $ext = $f['ext'] ?? 'n/a';
+    $formatId = $f['format_id'] ?? 'n/a';
+    echo "  [$i] format_id={$formatId} vcodec={$vcodec} ext={$ext}\n";
+}
+echo "REQUESTED_DOWNLOADS COUNT: " . (isset($meta['requested_downloads']) ? count($meta['requested_downloads']) : 0) . "\n";
+
         echo "TOP KEYS: " . implode(', ', array_keys($meta ?? [])) . "\n";
         if (!empty($meta['entries'])) {
             echo "ENTRIES COUNT: " . count($meta['entries']) . "\n";
