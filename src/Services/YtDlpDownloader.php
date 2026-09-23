@@ -35,42 +35,61 @@ final class YtDlpDownloader implements MediaDownloaderInterface
 
         // 2. Обработка карусели слайдов
         if ($isPhoto) {
-            $imgPattern = "{$tempDir}/slide_%(autonumber)02d.%(ext)s";
-            
-            // Скачиваем превью/слайды
-            $cmd = sprintf(
-                'yt-dlp --no-warnings --socket-timeout %d --write-all-thumbnails --skip-download -o %s %s 2>&1',
-                $this->socketTimeout,
-                escapeshellarg($imgPattern),
-                escapeshellarg($url)
-            );
-            exec($cmd);
-
-            $files = scandir($tempDir) ?: [];
+            $thumbnails = $meta['thumbnails'] ?? [];
             $images = [];
-            $seenHashes = [];
+            $seenUrls = [];
 
-            foreach ($files as $file) {
-                if ($file === '.' || $file === '..') {
+            // TikTok отдает список всех картинок карусели прямо в метаданных
+            foreach ($thumbnails as $idx => $thumb) {
+                $rawImgUrl = $thumb['url'] ?? null;
+                if (!$rawImgUrl) {
                     continue;
                 }
-                $path = "{$tempDir}/{$file}";
-                $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
 
-                if (in_array($ext, ['jpg', 'jpeg', 'png', 'webp'], true) && filesize($path) > 10000) {
-                    // Считаем хеш содержимого файла для исключения визуальных копий
-                    $hash = md5_file($path);
+                // Убираем параметры сжатия из URL, чтобы не дублировать размеры
+                $cleanUrl = strtok($rawImgUrl, '?');
+                if (isset($seenUrls[$cleanUrl])) {
+                    continue;
+                }
+                $seenUrls[$cleanUrl] = true;
 
-                    if ($hash !== false && !isset($seenHashes[$hash])) {
-                        $seenHashes[$hash] = true;
-                        $images[] = $path;
-                    } else {
-                        // Удаляем дубль сразу с диска
-                        @unlink($path);
+                $targetFile = sprintf('%s/slide_%02d.jpg', $tempDir, count($images) + 1);
+
+                // Быстро скачиваем фото
+                $content = @file_get_contents($rawImgUrl);
+                if ($content !== false && strlen($content) > 10000) {
+                    file_put_contents($targetFile, $content);
+                    $images[] = $targetFile;
+                }
+            }
+
+            // Если через метаданные не скачалось, используем фоллбек через yt-dlp
+            if (empty($images)) {
+                $cmd = sprintf(
+                    'yt-dlp --no-warnings --socket-timeout %d --write-all-thumbnails --skip-download -P %s %s 2>&1',
+                    $this->socketTimeout,
+                    escapeshellarg($tempDir),
+                    escapeshellarg($url)
+                );
+                exec($cmd);
+
+                $files = scandir($tempDir) ?: [];
+                $seenHashes = [];
+                foreach ($files as $file) {
+                    if ($file === '.' || $file === '..') continue;
+                    $path = "{$tempDir}/{$file}";
+                    $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+                    if (in_array($ext, ['jpg', 'jpeg', 'png', 'webp'], true) && filesize($path) > 10000) {
+                        $hash = md5_file($path);
+                        if ($hash !== false && !isset($seenHashes[$hash])) {
+                            $seenHashes[$hash] = true;
+                            $images[] = $path;
+                        } else {
+                            @unlink($path);
+                        }
                     }
                 }
             }
-            sort($images);
 
             if (!empty($images)) {
                 return new DownloadResult(MediaType::CAROUSEL, $images, $tempDir);
