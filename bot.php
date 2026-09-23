@@ -24,7 +24,7 @@ $client = new Client([
 ]);
 
 $offset = 0;
-echo "Бот на базе локального yt-dlp запущен...\n";
+echo "Бот yt-dlp (видео + фотопосты /photo/) запущен...\n";
 
 while (true) {
     try {
@@ -74,7 +74,7 @@ while (true) {
                         ],
                     ]);
 
-                    // Разворачиваем короткие ссылки vt.tiktok.com
+                    // 1. Разворачиваем короткие ссылки vt.tiktok.com / vm.tiktok.com
                     if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
                         try {
                             $redirectResponse = $client->get($tiktokUrl, [
@@ -96,51 +96,99 @@ while (true) {
                         }
                     }
 
-                    $cleanUrl = strtok($tiktokUrl, '?');
-                    echo "Запуск yt-dlp для: {$cleanUrl}\n";
+                    // 2. Достаем ID (поддерживает и /video/123, и /photo/123)
+                    preg_match('/[\/](video|photo)[\/](\d+)/', $tiktokUrl, $idMatches);
+                    $mediaType = $idMatches[1] ?? null;
+                    $mediaId   = $idMatches[2] ?? null;
 
-                    // 1. Получаем метаданные через yt-dlp
+                    // Нормализуем URL без пробелов и мусора
+                    if ($mediaId) {
+                        $targetUrl = "https://www.tiktok.com/@i/video/{$mediaId}";
+                    } else {
+                        $targetUrl = strtok($tiktokUrl, '?');
+                        $targetUrl = str_replace(' ', '%20', $targetUrl);
+                    }
+
+                    echo "Обработка URL: {$targetUrl} (Тип: {$mediaType})\n";
+
+                    // 3. Если это фотопост (/photo/) — достаем картинки через yt-dlp
+                    if ($mediaType === 'photo') {
+                        $imgCmd = sprintf(
+                            'yt-dlp --flat-playlist --print urls --socket-timeout 15 %s 2>&1',
+                            escapeshellarg($targetUrl)
+                        );
+
+                        $rawLines = [];
+                        exec($imgCmd, $rawLines);
+
+                        $imageUrls = array_values(array_filter($rawLines, function ($line) {
+                            $trimmed = trim($line);
+                            return filter_var($trimmed, FILTER_VALIDATE_URL) && !str_contains($trimmed, '.mp4');
+                        }));
+
+                        if (!empty($imageUrls)) {
+                            echo "Найдено " . count($imageUrls) . " фото. Отправляю...\n";
+                            $mediaGroup = [];
+                            $photos = array_slice($imageUrls, 0, 10);
+                            foreach ($photos as $i => $imgUrl) {
+                                $mediaGroup[] = [
+                                    'type'    => 'photo',
+                                    'media'   => trim($imgUrl),
+                                    'caption' => ($i === 0) ? 'Скачано через @sfayzttbot' : '',
+                                ];
+                            }
+
+                            $client->post($telegramApiUrl . 'sendMediaGroup', [
+                                'json' => [
+                                    'chat_id' => $chatId,
+                                    'media'   => $mediaGroup,
+                                ],
+                            ]);
+                            echo "Фотографии успешно отправлены.\n";
+                            continue;
+                        }
+                    }
+
+                    // 4. Проверяем метаданные на случай, если ссылка была /video/, но внутри карусель
                     $dumpCmd = sprintf(
-                        'yt-dlp -J --no-warnings --no-playlist %s 2>&1',
-                        escapeshellarg($cleanUrl)
+                        'yt-dlp -J --no-warnings --no-playlist --socket-timeout 15 %s 2>&1',
+                        escapeshellarg($targetUrl)
                     );
-
                     $jsonRaw = shell_exec($dumpCmd);
                     $info = json_decode($jsonRaw, true);
 
-                    // 2. Если это фото-карусель (entries содержат картинки)
-                    $imageUrls = [];
                     if (!empty($info['entries'])) {
+                        $carouselImages = [];
                         foreach ($info['entries'] as $entry) {
                             if (!empty($entry['url'])) {
-                                $imageUrls[] = $entry['url'];
+                                $carouselImages[] = $entry['url'];
                             }
                         }
-                    }
 
-                    if (!empty($imageUrls)) {
-                        echo "Найдена фото-карусель из " . count($imageUrls) . " фото. Отправляю...\n";
-                        $mediaGroup = [];
-                        $photos = array_slice($imageUrls, 0, 10);
-                        foreach ($photos as $i => $imgUrl) {
-                            $mediaGroup[] = [
-                                'type'    => 'photo',
-                                'media'   => $imgUrl,
-                                'caption' => ($i === 0) ? 'Скачано через @sfayzttbot' : '',
-                            ];
+                        if (!empty($carouselImages)) {
+                            echo "Карусель из " . count($carouselImages) . " фото. Отправляю...\n";
+                            $mediaGroup = [];
+                            $photos = array_slice($carouselImages, 0, 10);
+                            foreach ($photos as $i => $imgUrl) {
+                                $mediaGroup[] = [
+                                    'type'    => 'photo',
+                                    'media'   => $imgUrl,
+                                    'caption' => ($i === 0) ? 'Скачано через @sfayzttbot' : '',
+                                ];
+                            }
+
+                            $client->post($telegramApiUrl . 'sendMediaGroup', [
+                                'json' => [
+                                    'chat_id' => $chatId,
+                                    'media'   => $mediaGroup,
+                                ],
+                            ]);
+                            echo "Фотографии доставлены.\n";
+                            continue;
                         }
-
-                        $client->post($telegramApiUrl . 'sendMediaGroup', [
-                            'json' => [
-                                'chat_id' => $chatId,
-                                'media'   => $mediaGroup,
-                            ],
-                        ]);
-                        echo "Фото доставлены.\n";
-                        continue;
                     }
 
-                    // 3. Если это видео: качаем без сжатия в исходном качестве
+                    // 5. Если это видео — скачиваем MP4
                     $tempDir = sys_get_temp_dir();
                     $filePrefix = uniqid('tt_');
                     $outputPattern = "{$tempDir}/{$filePrefix}.%(ext)s";
@@ -148,7 +196,7 @@ while (true) {
                     $dlCmd = sprintf(
                         'yt-dlp --no-warnings -f "bestvideo+bestaudio/best" --merge-output-format mp4 -o %s %s 2>&1',
                         escapeshellarg($outputPattern),
-                        escapeshellarg($cleanUrl)
+                        escapeshellarg($targetUrl)
                     );
 
                     echo "Скачивание видео через yt-dlp...\n";
