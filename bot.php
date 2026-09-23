@@ -12,7 +12,7 @@ if (file_exists(__DIR__ . '/.env')) {
 
 $botToken = getenv('TELEGRAM_BOT_TOKEN') ?: ($_ENV['TELEGRAM_BOT_TOKEN'] ?? null);
 if (!$botToken) {
-    exit("Ошибка: Токен бота не найден\n");
+    exit("Ошибка: Токен бота не найден в переменных окружения\n");
 }
 
 $telegramApiUrl = "https://api.telegram.org/bot{$botToken}/";
@@ -20,6 +20,7 @@ $telegramApiUrl = "https://api.telegram.org/bot{$botToken}/";
 $client = new Client([
     'timeout'         => 30.0,
     'allow_redirects' => true,
+    'verify'          => false,
 ]);
 
 $offset = 0;
@@ -67,7 +68,7 @@ while (true) {
                         ],
                     ]);
 
-                    // 1. Разворачиваем короткие ссылки vt.tiktok.com / vm.tiktok.com
+                    // 1. Разворачиваем короткие ссылки (vt.tiktok.com / vm.tiktok.com)
                     if (str_contains($tiktokUrl, 'vt.tiktok.com') || str_contains($tiktokUrl, 'vm.tiktok.com')) {
                         try {
                             $redirectResponse = $client->get($tiktokUrl, [
@@ -85,18 +86,25 @@ while (true) {
                                 $tiktokUrl = end($history);
                             }
                         } catch (\Throwable $e) {
-                            echo "Ошибка редиректа: " . $e->getMessage() . "\n";
+                            echo "Ошибка разворота редиректа: " . $e->getMessage() . "\n";
                         }
                     }
 
-                    // Чистим query-параметры и нормализуем пробелы/спецсимволы
-                    $cleanUrl = strtok($tiktokUrl, '?');
-                    $cleanUrl = str_replace(' ', '%20', $cleanUrl);
-                    echo "Парсинг URL: {$cleanUrl}\n";
+                    // 2. Извлекаем ID видео и собираем каноничный URL без пробелов и мусора
+                    preg_match('/\/video\/(\d+)/', $tiktokUrl, $idMatches);
+                    $videoId = $idMatches[1] ?? null;
+
+                    if ($videoId) {
+                        $cleanUrl = "https://www.tiktok.com/@i/video/{$videoId}";
+                    } else {
+                        $cleanUrl = strtok($tiktokUrl, '?');
+                    }
+
+                    echo "Итоговый URL для парсинга: {$cleanUrl}\n";
 
                     $mediaData = null;
 
-                    // 2. Основной запрос: оригинальный TikWM API
+                    // 3. Основной запрос: TikWM API
                     try {
                         $tikwmResponse = $client->post('https://www.tikwm.com/api/', [
                             'form_params' => [
@@ -114,7 +122,7 @@ while (true) {
                                 'Referer'         => 'https://www.tikwm.com/',
                             ],
                             'http_errors' => false,
-                            'timeout'     => 12,
+                            'timeout'     => 15,
                         ]);
 
                         $body = (string)$tikwmResponse->getBody();
@@ -128,44 +136,58 @@ while (true) {
                             ];
                             echo "Успешно получено от TikWM\n";
                         } else {
-                            echo "TikWM вернул ошибку, пробую резервный API...\n";
+                            echo "TikWM вернул: {$body}\n";
                         }
                     } catch (\Throwable $e) {
                         echo "Сбой TikWM: " . $e->getMessage() . "\n";
                     }
 
-                    // 3. Резервный открытый API (если TikWM временно отдал капчу/блок)
+                    // 4. Резервный шлюз LoveTik (если TikWM сбоит)
                     if (!$mediaData) {
                         try {
-                            $backupResponse = $client->get('https://api.tiklydown.eu.org/api/download', [
-                                'query' => ['url' => $cleanUrl],
+                            $backupResponse = $client->post('https://lovetik.com/api/ajax/search', [
+                                'form_params' => [
+                                    'query' => $cleanUrl,
+                                ],
                                 'headers' => [
-                                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36',
+                                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                                    'Accept'     => 'application/json',
+                                    'Referer'    => 'https://lovetik.com/',
                                 ],
                                 'http_errors' => false,
-                                'timeout'     => 12,
+                                'timeout'     => 15,
                             ]);
 
                             $bJson = json_decode((string)$backupResponse->getBody(), true);
-                            if (!empty($bJson['images'])) {
-                                $mediaData = [
-                                    'type'   => 'photos',
-                                    'images' => array_column($bJson['images'], 'url'),
-                                ];
-                            } elseif (!empty($bJson['video']['noWatermark'])) {
+                            $bVideo = null;
+
+                            if (!empty($bJson['links'])) {
+                                foreach ($bJson['links'] as $link) {
+                                    if (!empty($link['a']) && empty($link['watermark'])) {
+                                        $bVideo = $link['a'];
+                                        break;
+                                    }
+                                }
+                                if (!$bVideo && !empty($bJson['links'][0]['a'])) {
+                                    $bVideo = $bJson['links'][0]['a'];
+                                }
+                            }
+
+                            if ($bVideo) {
                                 $mediaData = [
                                     'type'  => 'video',
-                                    'video' => $bJson['video']['noWatermark'],
+                                    'video' => $bVideo,
                                 ];
+                                echo "Успешно получено от резервного API (LoveTik)\n";
                             }
                         } catch (\Throwable $e) {
                             echo "Сбой резервного API: " . $e->getMessage() . "\n";
                         }
                     }
 
-                    // 4. Отправка результата в чат
+                    // 5. Отправка результата в Telegram
                     if ($mediaData) {
-                        // АЛЬБОМ ФОТОГРАФИЙ
+                        // Альбом фотографий
                         if ($mediaData['type'] === 'photos' && !empty($mediaData['images'])) {
                             echo "Отправляю " . count($mediaData['images']) . " фото...\n";
                             $mediaGroup = [];
@@ -188,7 +210,7 @@ while (true) {
                             continue;
                         }
 
-                        // ВИДЕО БЕЗ ВОДЯНОГО ЗНАКА
+                        // Видео без водяного знака
                         if ($mediaData['type'] === 'video' && !empty($mediaData['video'])) {
                             $videoUrl = $mediaData['video'];
                             if (!str_starts_with($videoUrl, 'http')) {
