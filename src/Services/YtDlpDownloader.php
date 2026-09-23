@@ -30,6 +30,8 @@ final class YtDlpDownloader implements MediaDownloaderInterface
         $rawJson = shell_exec($jsonCmd);
         $meta = json_decode((string)$rawJson, true);
 
+        echo "YT-DLP VERSION: " . trim((string)shell_exec('yt-dlp --version 2>&1')) . "\n";
+
         $formats = $meta['formats'] ?? [];
 echo "FORMATS COUNT: " . count($formats) . "\n";
 foreach ($formats as $i => $f) {
