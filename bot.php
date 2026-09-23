@@ -12,19 +12,19 @@ if (file_exists(__DIR__ . '/.env')) {
 
 $botToken = getenv('TELEGRAM_BOT_TOKEN') ?: ($_ENV['TELEGRAM_BOT_TOKEN'] ?? null);
 if (!$botToken) {
-    exit("Ошибка: Токен бота не найден в переменных окружения\n");
+    exit("Ошибка: Токен бота не найден\n");
 }
 
 $telegramApiUrl = "https://api.telegram.org/bot{$botToken}/";
 $workerUrl = "https://tikwm-proxy.sfayzullaev007.workers.dev/";
 
 $client = new Client([
-    'timeout'         => 60.0,
+    'timeout'         => 30.0,
     'allow_redirects' => true,
 ]);
 
 $offset = 0;
-echo "Бот через Cloudflare Worker (с прямой передачей потока) запущен...\n";
+echo "Бот TikTok API запущен...\n";
 
 while (true) {
     try {
@@ -52,7 +52,7 @@ while (true) {
                     $client->post($telegramApiUrl . 'sendMessage', [
                         'json' => [
                             'chat_id' => $chatId,
-                            'text'    => "Отправь ссылку на TikTok (видео или фото), и я пришлю всё без водяного знака.",
+                            'text'    => "Отправь ссылку на TikTok (видео или фото-карусель), и я пришлю всё без водяного знака.",
                         ],
                     ]);
                     continue;
@@ -99,7 +99,7 @@ while (true) {
                     $response = $client->get($workerUrl, [
                         'query'       => ['url' => $cleanUrl],
                         'http_errors' => false,
-                        'timeout'     => 20,
+                        'timeout'     => 15,
                     ]);
 
                     $rawBody = (string)$response->getBody();
@@ -131,56 +131,20 @@ while (true) {
                             continue;
                         }
 
-                        // 2. Обработка видео: скачиваем файл ботом и отправляем через multipart
+                        // 2. Обработка видео без водяного знака
                         $videoUrl = $item['play'] ?? null;
                         if ($videoUrl) {
-                            echo "Загрузка видео с CDN для передачи в TG...\n";
-                            $tempFile = tempnam(sys_get_temp_dir(), 'tt_vid_');
-                            
-                            $downloadSuccess = false;
-                            try {
-                                $client->get($videoUrl, [
-                                    'sink'    => $tempFile,
-                                    'headers' => [
-                                        'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                                        'Referer'    => 'https://www.tiktok.com/',
-                                    ],
-                                    'timeout' => 40,
-                                ]);
-                                $downloadSuccess = (file_exists($tempFile) && filesize($tempFile) > 1000);
-                            } catch (\Throwable $dlErr) {
-                                echo "Ошибка скачивания видеофайла: " . $dlErr->getMessage() . "\n";
-                            }
-
-                            if ($downloadSuccess) {
-                                echo "Видео скачано (" . filesize($tempFile) . " байт). Отправляю в Telegram...\n";
-                                $client->post($telegramApiUrl . 'sendVideo', [
-                                    'multipart' => [
-                                        [
-                                            'name'     => 'chat_id',
-                                            'contents' => (string)$chatId,
-                                        ],
-                                        [
-                                            'name'     => 'video',
-                                            'contents' => fopen($tempFile, 'r'),
-                                            'filename' => 'video.mp4',
-                                        ],
-                                        [
-                                            'name'     => 'caption',
-                                            'contents' => 'Скачано через @sfayzttbot',
-                                        ],
-                                        [
-                                            'name'     => 'supports_streaming',
-                                            'contents' => 'true',
-                                        ],
-                                    ],
-                                ]);
-                                @unlink($tempFile);
-                                echo "Видео успешно доставлено.\n";
-                                continue;
-                            } else {
-                                @unlink($tempFile);
-                            }
+                            echo "Отправка видео напрямую в Telegram...\n";
+                            $client->post($telegramApiUrl . 'sendVideo', [
+                                'json' => [
+                                    'chat_id'            => $chatId,
+                                    'video'              => $videoUrl,
+                                    'caption'            => 'Скачано через @sfayzttbot',
+                                    'supports_streaming' => true,
+                                ],
+                            ]);
+                            echo "Видео успешно доставлено.\n";
+                            continue;
                         }
                     }
 
