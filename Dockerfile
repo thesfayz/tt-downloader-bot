@@ -17,4 +17,4 @@ COPY . .
 # Создаем папку для временных видео
 RUN mkdir -p /app/downloads && chmod 777 /app/downloads
 
-CMD php bot.php & php -S 0.0.0.0:${PORT:-10000} index.php
+CMD php bot.php & php -S 0.0.0.0:${PORT:-8080} index.php
