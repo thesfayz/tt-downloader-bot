@@ -30,6 +30,39 @@ final class YtDlpDownloader implements MediaDownloaderInterface
         $rawJson = shell_exec($jsonCmd);
         $meta = json_decode((string)$rawJson, true);
 
+        // --- ВРЕМЕННЫЙ ДЕБАГ: ищем встроенный JSON со списком картинок карусели ---
+$webpageUrl = $meta['webpage_url'] ?? $url;
+echo "DEBUG: fetching webpage_url = {$webpageUrl}\n";
+
+$pageHtml = @file_get_contents($webpageUrl, false, stream_context_create([
+    'http' => [
+        'header' => "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n",
+        'timeout' => 15,
+    ],
+]));
+
+if ($pageHtml === false) {
+    echo "DEBUG: не удалось скачать HTML страницы\n";
+} else {
+    echo "DEBUG: HTML size = " . strlen($pageHtml) . " bytes\n";
+
+    if (preg_match('/<script id="SIGI_STATE"[^>]*>(.*?)<\/script>/s', $pageHtml, $mm)) {
+        echo "DEBUG: FOUND SIGI_STATE, length=" . strlen($mm[1]) . "\n";
+    } else {
+        echo "DEBUG: SIGI_STATE NOT FOUND\n";
+    }
+
+    if (preg_match('/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)<\/script>/s', $pageHtml, $mm2)) {
+        echo "DEBUG: FOUND __UNIVERSAL_DATA_FOR_REHYDRATION__, length=" . strlen($mm2[1]) . "\n";
+    } else {
+        echo "DEBUG: __UNIVERSAL_DATA_FOR_REHYDRATION__ NOT FOUND\n";
+    }
+
+    echo "DEBUG: contains 'imagePost' = " . (str_contains($pageHtml, 'imagePost') ? 'YES' : 'no') . "\n";
+    echo "DEBUG: contains '\"images\":' = " . (str_contains($pageHtml, '"images":') ? 'YES' : 'no') . "\n";
+}
+// --- КОНЕЦ ВРЕМЕННОГО ДЕБАГА ---
+
         echo "YT-DLP VERSION: " . trim((string)shell_exec('yt-dlp --version 2>&1')) . "\n";
 
         $formats = $meta['formats'] ?? [];
