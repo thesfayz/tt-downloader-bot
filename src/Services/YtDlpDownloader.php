@@ -30,7 +30,7 @@ final class YtDlpDownloader implements MediaDownloaderInterface
         // 2. Если это не карусель — качаем видео через стабильный yt-dlp
         $videoPath = "{$tempDir}/video.mp4";
         $videoCmd = sprintf(
-            'yt-dlp --no-warnings --socket-timeout %d -f "bv*[vcodec!=none]+ba/b[vcodec!=none]/b" --merge-output-format mp4 --no-part -o %s %s 2>&1',
+            'yt-dlp --no-warnings --socket-timeout %d -f "bv*[vcodec^=avc1]+ba/b[vcodec^=avc1]/bv*+ba/b" --merge-output-format mp4 --no-part -o %s %s 2>&1',
             $this->socketTimeout,
             escapeshellarg($videoPath),
             escapeshellarg($url)
