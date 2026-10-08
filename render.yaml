@@ -1,0 +1,12 @@
+services:
+  # Бот должен быть Web Service (не Worker!): на бесплатном тарифе Render
+  # у Web Service есть бесплатный egress-трафик, у Worker его нет — бот бы просто не скачивал.
+  - type: web
+    name: tiktok-bot
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false   # задаётся один раз в дашборде Render (Secret)
