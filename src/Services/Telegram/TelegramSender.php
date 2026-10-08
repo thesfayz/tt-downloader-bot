@@ -20,25 +20,44 @@ final class TelegramSender implements MessageSenderInterface
 
     public function sendMessage(int $chatId, string $text): void
     {
-        $this->client->request('POST', $this->baseUrl . 'sendMessage', [
+        $response = $this->client->request('POST', $this->baseUrl . 'sendMessage', [
             'json' => [
                 'chat_id' => $chatId,
                 'text' => $text,
             ],
             'http_errors' => false,
         ]);
+
+        if ($response->getStatusCode() !== 200) {
+            echo "[TelegramSender] sendMessage HTTP {$response->getStatusCode()}: "
+                . (string)$response->getBody() . "\n";
+        }
     }
 
     public function sendPhoto(int $chatId, string $filePath, string $caption = ''): void
     {
-        $this->client->request('POST', $this->baseUrl . 'sendPhoto', [
+        if (!is_file($filePath)) {
+            throw new \RuntimeException("Файл не найден: {$filePath}");
+        }
+
+        $handle = fopen($filePath, 'r');
+        if ($handle === false) {
+            throw new \RuntimeException("Не удалось открыть файл: {$filePath}");
+        }
+
+        $response = $this->client->request('POST', $this->baseUrl . 'sendPhoto', [
             'multipart' => [
                 ['name' => 'chat_id', 'contents' => (string)$chatId],
-                ['name' => 'photo',   'contents' => fopen($filePath, 'r'), 'filename' => 'photo.jpg'],
+                ['name' => 'photo',   'contents' => $handle, 'filename' => basename($filePath)],
                 ['name' => 'caption', 'contents' => $caption],
             ],
             'http_errors' => false,
         ]);
+
+        if ($response->getStatusCode() !== 200) {
+            echo "[TelegramSender] sendPhoto HTTP {$response->getStatusCode()}: "
+                . (string)$response->getBody() . "\n";
+        }
     }
 
     public function sendMediaGroup(int $chatId, array $filePaths, string $caption = ''): void
@@ -58,12 +77,20 @@ final class TelegramSender implements MessageSenderInterface
             $mediaGroup = [];
 
             foreach ($chunk as $idx => $filePath) {
+                if (!is_file($filePath)) {
+                    continue;
+                }
+                $handle = fopen($filePath, 'r');
+                if ($handle === false) {
+                    continue;
+                }
+
                 $attachKey = "photo_{$chunkIndex}_{$idx}";
 
                 $multipart[] = [
                     'name'     => $attachKey,
-                    'contents' => fopen($filePath, 'r'),
-                    'filename' => "photo_{$idx}.jpg",
+                    'contents' => $handle,
+                    'filename' => basename($filePath),
                 ];
 
                 $mediaItem = [
@@ -79,6 +106,16 @@ final class TelegramSender implements MessageSenderInterface
                 $mediaGroup[] = $mediaItem;
             }
 
+            if ($mediaGroup === []) {
+                continue;
+            }
+
+            // Одиночное фото отправляем через sendPhoto (sendMediaGroup требует 2+ элементов)
+            if (count($mediaGroup) === 1) {
+                $this->sendPhoto($chatId, $chunk[array_key_first($chunk)] ?? '', $caption);
+                continue;
+            }
+
             $multipart[] = [
                 'name'     => 'media',
                 'contents' => json_encode($mediaGroup, JSON_UNESCAPED_SLASHES),
@@ -91,21 +128,50 @@ final class TelegramSender implements MessageSenderInterface
 
             // Если Telegram отклонил медиагруппу — пишем в лог для отладки
             if ($response->getStatusCode() !== 200) {
-                echo "Ошибка Telegram API при отправке альбома: " . (string)$response->getBody() . "\n";
+                echo "[TelegramSender] sendMediaGroup HTTP {$response->getStatusCode()}: "
+                    . (string)$response->getBody() . "\n";
             }
         }
     }
 
     public function sendVideo(int $chatId, string $filePath, string $caption = ''): void
     {
-        $this->client->request('POST', $this->baseUrl . 'sendVideo', [
-            'multipart' => [
-                ['name' => 'chat_id',            'contents' => (string)$chatId],
-                ['name' => 'video',              'contents' => fopen($filePath, 'r'), 'filename' => 'video.mp4'],
-                ['name' => 'caption',            'contents' => $caption],
-                ['name' => 'supports_streaming', 'contents' => 'true'],
-            ],
+        if (!is_file($filePath)) {
+            throw new \RuntimeException("Файл не найден: {$filePath}");
+        }
+
+        $size = filesize($filePath);
+        if ($size === false || $size > 50 * 1024 * 1024) {
+            $this->sendMessage(
+                $chatId,
+                'Видео слишком большое для прямой отправки (лимит Telegram — 50 МБ).'
+            );
+            return;
+        }
+
+        $handle = fopen($filePath, 'r');
+        if ($handle === false) {
+            throw new \RuntimeException("Не удалось открыть файл: {$filePath}");
+        }
+
+        $multipart = [
+            ['name' => 'chat_id', 'contents' => (string)$chatId],
+            ['name' => 'video',   'contents' => $handle, 'filename' => basename($filePath)],
+            ['name' => 'supports_streaming', 'contents' => 'true'],
+        ];
+
+        if ($caption !== '') {
+            $multipart[] = ['name' => 'caption', 'contents' => $caption];
+        }
+
+        $response = $this->client->request('POST', $this->baseUrl . 'sendVideo', [
+            'multipart'   => $multipart,
             'http_errors' => false,
         ]);
+
+        if ($response->getStatusCode() !== 200) {
+            echo "[TelegramSender] sendVideo HTTP {$response->getStatusCode()}: "
+                . (string)$response->getBody() . "\n";
+        }
     }
 }
