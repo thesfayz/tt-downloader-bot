@@ -30,10 +30,20 @@ final class TikTokDownloadHandler implements HandlerInterface
 
         $this->sender->sendMessage($chatId, "Загружаю, подожди пару секунд...");
 
-        $resolvedUrl = $this->urlResolver->resolve($rawUrl);
+        try {
+            $resolvedUrl = $this->urlResolver->resolve($rawUrl);
+        } catch (\Throwable $e) {
+            $this->sender->sendMessage($chatId, 'Не удалось обработать ссылку: ' . $e->getMessage());
+            return;
+        }
         echo "Обработка URL: {$resolvedUrl}\n";
 
-        $result = $this->downloader->download($resolvedUrl);
+        try {
+            $result = $this->downloader->download($resolvedUrl);
+        } catch (\Throwable $e) {
+            $this->sender->sendMessage($chatId, 'Ошибка при скачивании: ' . $e->getMessage());
+            return;
+        }
 
         if ($result === null) {
             $this->sender->sendMessage($chatId, "Не удалось загрузить медиа по этой ссылке.");
