@@ -30,7 +30,9 @@ final class BotRunner
                 }
             } catch (\Throwable $e) {
                 echo "Ошибка цикла polling: " . $e->getMessage() . "\n";
-                sleep(2);
+                // Пауза обязательна: без неё при 429 (Too Many Requests) или сетевом
+                // сбое получаем бесконечный спам-цикл и бан по rate limit.
+                sleep(5);
             }
 
             usleep(500000);
