@@ -1,13 +1,11 @@
 FROM php:8.2-cli-alpine
 
-# Устанавливаем зависимости
-RUN apk add --no-cache git unzip curl python3 py3-pip ffmpeg
+# Устанавливаем зависимости (python3 нужен yt-dlp для внутренних операций)
+RUN apk add --no-cache git unzip curl wget python3 ffmpeg
 
-# Принудительно создаем симлинк python -> python3 (перезаписываем если есть)
-RUN ln -sf /usr/bin/python3 /usr/bin/python
-
-# Устанавливаем yt-dlp
-RUN pip install --no-cache-dir yt-dlp
+# Скачиваем готовый бинарник yt-dlp (не требует pip)
+RUN wget -qO /usr/local/bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp && \
+    chmod +x /usr/local/bin/yt-dlp
 
 COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
 
