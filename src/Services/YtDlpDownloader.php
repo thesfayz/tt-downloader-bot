@@ -11,7 +11,7 @@ use App\DTO\MediaType;
 final class YtDlpDownloader implements MediaDownloaderInterface
 {
     public function __construct(
-        private readonly int $socketTimeout = 30
+        private readonly int $socketTimeout = 20
     ) {}
 
     public function download(string $url): ?DownloadResult
@@ -21,53 +21,55 @@ final class YtDlpDownloader implements MediaDownloaderInterface
             return null;
         }
 
-        // ШАГ 1: Пробуем быстрый парсер через API без водяного знака (0.5 сек)
-        $fastResult = $this->tryFastApiDownload($url, $tempDir);
-        if ($fastResult !== null) {
-            return $fastResult;
+        // 1. Резолвим короткую ссылку (vt.tiktok.com) только через заголовки (без скачивания тела)
+        $fullUrl = $this->resolveRedirectOnly($url);
+
+        // 2. Достаем ID видео
+        $videoId = $this->extractVideoId($fullUrl);
+        if ($videoId === null) {
+            // Если ID не спарсился из URL, пробуем быстро достать его через легкий cURL
+            $videoId = $this->fetchVideoIdFromWeb($fullUrl);
         }
 
-        // ШАГ 2: Фоллбэк на карусель из HTML (если это слайды)
-        $images = $this->extractImagesFromHtml($url, $tempDir);
-        if (!empty($images)) {
-            return new DownloadResult(MediaType::CAROUSEL, $images, $tempDir);
+        // 3. Загрузка через мобильный API TikTok (0 RAM, отдаёт чистый H264)
+        if ($videoId !== null) {
+            $result = $this->downloadViaAwemeApi($videoId, $tempDir);
+            if ($result !== null) {
+                return $result;
+            }
         }
 
-        // ШАГ 3: Фоллбэк на yt-dlp с форсированным сжатием в H264, если прилетел HEVC
+        // 4. Запасной быстрый фоллбэк: yt-dlp с жестким лимитом памяти и времени
         $videoPath = "{$tempDir}/video.mp4";
-        
-        // Качаем avc1, если нет - берем лучшее
         $videoCmd = sprintf(
-            'yt-dlp --no-warnings --socket-timeout %d -f "bv*[vcodec^=avc1]+ba/b[vcodec^=avc1]/best" --merge-output-format mp4 --no-part -o %s %s 2>&1',
+            'yt-dlp --no-warnings --no-playlist --socket-timeout %d -f "b[vcodec^=avc1]/bv*[vcodec^=avc1]+ba/b" --no-part -o %s %s 2>&1',
             $this->socketTimeout,
             escapeshellarg($videoPath),
-            escapeshellarg($url)
+            escapeshellarg($fullUrl)
         );
         exec($videoCmd);
 
         if (file_exists($videoPath) && filesize($videoPath) > 50000) {
-            // Проверяем: если видео всё-таки скачалось в HEVC, быстро ремуксим его через ffmpeg
-            $fixedVideoPath = $this->ensureH264Compatible($videoPath, $tempDir);
-            return new DownloadResult(MediaType::VIDEO, [$fixedVideoPath], $tempDir);
+            return new DownloadResult(MediaType::VIDEO, [$videoPath], $tempDir);
         }
 
         (new DownloadResult(MediaType::UNKNOWN, [], $tempDir))->cleanup();
         return null;
     }
 
-    /**
-     * Быстрый парсер без водяных знаков через открытый TikWM mirror / API
-     */
-    private function tryFastApiDownload(string $url, string $tempDir): ?DownloadResult
+    private function downloadViaAwemeApi(string $videoId, string $tempDir): ?DownloadResult
     {
-        $apiUrl = 'https://api.tiklydown.eu.org/api/download?url=' . urlencode($url);
+        $apiUrl = "https://api16-normal-c-useast1a.tiktokv.com/aweme/v1/feed/?aweme_id={$videoId}";
 
         $ch = curl_init($apiUrl);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT        => 8,
             CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_USERAGENT      => 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+            CURLOPT_USERAGENT      => 'com.zhiliaoapp.musically/2022600030 (Linux; U; Android 12; en_US; Pixel 6)',
+            CURLOPT_HTTPHEADER     => [
+                'Accept: application/json',
+            ],
         ]);
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -78,50 +80,40 @@ final class YtDlpDownloader implements MediaDownloaderInterface
         }
 
         $data = json_decode((string)$response, true);
-        if (!is_array($data)) {
+        $item = $data['aweme_list'][0] ?? null;
+        if (!is_array($item)) {
             return null;
         }
 
-        // Если это карусель фоток
-        if (!empty($data['images']) && is_array($data['images'])) {
-            $downloaded = [];
-            foreach ($data['images'] as $idx => $img) {
-                $imgUrl = is_array($img) ? ($img['url'] ?? null) : $img;
-                if (!$imgUrl) continue;
+        // Проверяем: это карусель фоток?
+        if (!empty($item['image_post_info']['images'])) {
+            $images = [];
+            foreach ($item['image_post_info']['images'] as $idx => $img) {
+                $imgUrl = $img['display_image']['url_list'][0] ?? null;
+                if (!$imgUrl) {
+                    continue;
+                }
 
                 $target = sprintf('%s/slide_%02d.jpg', $tempDir, $idx + 1);
-                $content = @file_get_contents($imgUrl);
-                if ($content && strlen($content) > 3000) {
-                    file_put_contents($target, $content);
-                    $downloaded[] = $target;
+                if ($this->streamDownloadToFile($imgUrl, $target)) {
+                    $images[] = $target;
                 }
             }
-            if (!empty($downloaded)) {
-                return new DownloadResult(MediaType::CAROUSEL, $downloaded, $tempDir);
+
+            if (!empty($images)) {
+                return new DownloadResult(MediaType::CAROUSEL, $images, $tempDir);
             }
         }
 
-        // Если это видео без водяного знака
-        $videoUrl = $data['video']['noWatermark'] 
-            ?? $data['video']['watermark'] 
-            ?? ($data['video']['url'] ?? null);
+        // Это видео: достаем прямой MP4 (без водяных знаков)
+        $videoUrls = $item['video']['play_addr']['url_list'] ?? [];
+        if (empty($videoUrls)) {
+            return null;
+        }
 
-        if ($videoUrl) {
-            $videoPath = "{$tempDir}/video.mp4";
-            $fp = fopen($videoPath, 'w+');
-            
-            $ch = curl_init($videoUrl);
-            curl_setopt_array($ch, [
-                CURLOPT_FILE           => $fp,
-                CURLOPT_TIMEOUT        => 20,
-                CURLOPT_FOLLOWLOCATION => true,
-                CURLOPT_USERAGENT      => 'com.zhiliaoapp.musically/2022600030 (Linux; U; Android 12; en_US; Pixel 6)',
-            ]);
-            curl_exec($ch);
-            curl_close($ch);
-            fclose($fp);
-
-            if (file_exists($videoPath) && filesize($videoPath) > 50000) {
+        $videoPath = "{$tempDir}/video.mp4";
+        foreach ($videoUrls as $streamUrl) {
+            if ($this->streamDownloadToFile($streamUrl, $videoPath)) {
                 return new DownloadResult(MediaType::VIDEO, [$videoPath], $tempDir);
             }
         }
@@ -130,106 +122,88 @@ final class YtDlpDownloader implements MediaDownloaderInterface
     }
 
     /**
-     * Если yt-dlp всё-таки отдал HEVC (hvc1), ffmpeg быстро перегоняет его в h264
+     * Потоковое скачивание сразу на диск (не жрёт оперативную память PHP)
      */
-    private function ensureH264Compatible(string $videoPath, string $tempDir): string
+    private function streamDownloadToFile(string $sourceUrl, string $destinationPath): bool
     {
-        // Проверяем кодек через ffprobe
-        $codec = trim((string)shell_exec(sprintf(
-            'ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 %s',
-            escapeshellarg($videoPath)
-        )));
-
-        // Если это уже h264 — отдаем как есть
-        if ($codec === 'h264') {
-            return $videoPath;
+        $fp = fopen($destinationPath, 'w+');
+        if (!$fp) {
+            return false;
         }
 
-        // Если это hevc/h265 — пережимаем с ultrafast пресетом (займет 3-4 секунды)
-        $outPath = "{$tempDir}/fixed_video.mp4";
-        $cmd = sprintf(
-            'ffmpeg -y -i %s -c:v libx264 -preset ultrafast -crf 26 -c:a copy %s 2>&1',
-            escapeshellarg($videoPath),
-            escapeshellarg($outPath)
-        );
-        exec($cmd);
+        $ch = curl_init($sourceUrl);
+        curl_setopt_array($ch, [
+            CURLOPT_FILE           => $fp,
+            CURLOPT_TIMEOUT        => 25,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_USERAGENT      => 'com.zhiliaoapp.musically/2022600030 (Linux; U; Android 12; en_US; Pixel 6)',
+            CURLOPT_HTTPHEADER     => [
+                'Referer: https://www.tiktok.com/',
+            ],
+        ]);
+        curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        fclose($fp);
 
-        return (file_exists($outPath) && filesize($outPath) > 50000) ? $outPath : $videoPath;
+        if ($code === 200 && file_exists($destinationPath) && filesize($destinationPath) > 5000) {
+            return true;
+        }
+
+        if (file_exists($destinationPath)) {
+            @unlink($destinationPath);
+        }
+
+        return false;
     }
 
     /**
-     * @return list<string>
+     * Быстрый резолв коротких ссылок HEAD-запросом без скачивания тела страницы
      */
-    private function extractImagesFromHtml(string $url, string $tempDir): array
+    private function resolveRedirectOnly(string $url): string
     {
-        $context = stream_context_create([
-            'http' => [
-                'header'  => "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n",
-                'timeout' => 15,
-            ],
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_NOBODY         => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_TIMEOUT        => 5,
+            CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         ]);
+        curl_exec($ch);
+        $effectiveUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
+        curl_close($ch);
 
-        $html = @file_get_contents($url, false, $context);
-        if (!$html) {
-            return [];
-        }
-
-        if (!preg_match('/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)<\/script>/s', $html, $matches)) {
-            return [];
-        }
-
-        $data = json_decode(trim($matches[1]), true);
-        if (!is_array($data)) {
-            return [];
-        }
-
-        $itemStruct = $data['__DEFAULT_SCOPE__']['webapp.video-detail']['itemInfo']['itemStruct']
-            ?? $this->findKeyRecursive($data, 'itemStruct');
-
-        if (!is_array($itemStruct)) {
-            return [];
-        }
-
-        $imagePostInfo = $itemStruct['imagePost'] ?? null;
-        if (empty($imagePostInfo['images'])) {
-            return [];
-        }
-
-        $downloaded = [];
-        foreach ($imagePostInfo['images'] as $idx => $img) {
-            $urlList = $img['displayImage']['urlList'] ?? ($img['imageURL']['urlList'] ?? []);
-            if (empty($urlList)) {
-                continue;
-            }
-
-            $imgUrl = $urlList[0];
-            $target = sprintf('%s/slide_%02d.jpg', $tempDir, $idx + 1);
-
-            $fileData = @file_get_contents($imgUrl, false, $context);
-            if ($fileData !== false && strlen($fileData) > 5000) {
-                file_put_contents($target, $fileData);
-                $downloaded[] = $target;
-            }
-        }
-
-        return $downloaded;
+        return $effectiveUrl ?: $url;
     }
 
-    private function findKeyRecursive(array $array, string $keyToFind): mixed
+    private function extractVideoId(string $url): ?string
     {
-        if (array_key_exists($keyToFind, $array)) {
-            return $array[$keyToFind];
+        if (preg_match('/video\/(\d+)/', $url, $m)) {
+            return $m[1];
         }
-
-        foreach ($array as $value) {
-            if (is_array($value)) {
-                $result = $this->findKeyRecursive($value, $keyToFind);
-                if ($result !== null) {
-                    return $result;
-                }
-            }
+        if (preg_match('/\/v\/(\d+)/', $url, $m)) {
+            return $m[1];
         }
+        return null;
+    }
 
+    private function fetchVideoIdFromWeb(string $url): ?string
+    {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_TIMEOUT        => 5,
+            CURLOPT_RANGE          => '0-40960', // читаем только первые 40 КБ, чтобы не тратить память
+            CURLOPT_USERAGENT      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        ]);
+        $chunk = (string)curl_exec($ch);
+        curl_close($ch);
+
+        if (preg_match('/"videoId":"(\d+)"/', $chunk, $m)) {
+            return $m[1];
+        }
         return null;
     }
 }
