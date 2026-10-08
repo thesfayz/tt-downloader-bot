@@ -21,16 +21,24 @@ final class YtDlpDownloader implements MediaDownloaderInterface
             return null;
         }
 
-        // 1. Сначала проверяем: вдруг это карусель фоток (через стейт страницы)
+        // ШАГ 1: Пробуем быстрый парсер через API без водяного знака (0.5 сек)
+        $fastResult = $this->tryFastApiDownload($url, $tempDir);
+        if ($fastResult !== null) {
+            return $fastResult;
+        }
+
+        // ШАГ 2: Фоллбэк на карусель из HTML (если это слайды)
         $images = $this->extractImagesFromHtml($url, $tempDir);
         if (!empty($images)) {
             return new DownloadResult(MediaType::CAROUSEL, $images, $tempDir);
         }
 
-        // 2. Если это не карусель — качаем видео через стабильный yt-dlp
+        // ШАГ 3: Фоллбэк на yt-dlp с форсированным сжатием в H264, если прилетел HEVC
         $videoPath = "{$tempDir}/video.mp4";
+        
+        // Качаем avc1, если нет - берем лучшее
         $videoCmd = sprintf(
-            'yt-dlp --no-warnings --socket-timeout %d -f "bv*[vcodec^=avc1]+ba/b[vcodec^=avc1]/bv*+ba/b" --merge-output-format mp4 --no-part -o %s %s 2>&1',
+            'yt-dlp --no-warnings --socket-timeout %d -f "bv*[vcodec^=avc1]+ba/b[vcodec^=avc1]/best" --merge-output-format mp4 --no-part -o %s %s 2>&1',
             $this->socketTimeout,
             escapeshellarg($videoPath),
             escapeshellarg($url)
@@ -38,28 +46,115 @@ final class YtDlpDownloader implements MediaDownloaderInterface
         exec($videoCmd);
 
         if (file_exists($videoPath) && filesize($videoPath) > 50000) {
-            return new DownloadResult(MediaType::VIDEO, [$videoPath], $tempDir);
-        }
-
-        // Если и это не видео, пробуем достать реальный URL через yt-dlp и еще раз проверить на фото
-        $jsonCmd = sprintf(
-            'yt-dlp -J --no-warnings --socket-timeout %d %s 2>&1',
-            $this->socketTimeout,
-            escapeshellarg($url)
-        );
-        $rawJson = shell_exec($jsonCmd);
-        $meta = json_decode((string)$rawJson, true);
-
-        $webpageUrl = $meta['webpage_url'] ?? null;
-        if ($webpageUrl && $webpageUrl !== $url) {
-            $images = $this->extractImagesFromHtml($webpageUrl, $tempDir);
-            if (!empty($images)) {
-                return new DownloadResult(MediaType::CAROUSEL, $images, $tempDir);
-            }
+            // Проверяем: если видео всё-таки скачалось в HEVC, быстро ремуксим его через ffmpeg
+            $fixedVideoPath = $this->ensureH264Compatible($videoPath, $tempDir);
+            return new DownloadResult(MediaType::VIDEO, [$fixedVideoPath], $tempDir);
         }
 
         (new DownloadResult(MediaType::UNKNOWN, [], $tempDir))->cleanup();
         return null;
+    }
+
+    /**
+     * Быстрый парсер без водяных знаков через открытый TikWM mirror / API
+     */
+    private function tryFastApiDownload(string $url, string $tempDir): ?DownloadResult
+    {
+        $apiUrl = 'https://api.tiklydown.eu.org/api/download?url=' . urlencode($url);
+
+        $ch = curl_init($apiUrl);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 8,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_USERAGENT      => 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+        ]);
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($httpCode !== 200 || !$response) {
+            return null;
+        }
+
+        $data = json_decode((string)$response, true);
+        if (!is_array($data)) {
+            return null;
+        }
+
+        // Если это карусель фоток
+        if (!empty($data['images']) && is_array($data['images'])) {
+            $downloaded = [];
+            foreach ($data['images'] as $idx => $img) {
+                $imgUrl = is_array($img) ? ($img['url'] ?? null) : $img;
+                if (!$imgUrl) continue;
+
+                $target = sprintf('%s/slide_%02d.jpg', $tempDir, $idx + 1);
+                $content = @file_get_contents($imgUrl);
+                if ($content && strlen($content) > 3000) {
+                    file_put_contents($target, $content);
+                    $downloaded[] = $target;
+                }
+            }
+            if (!empty($downloaded)) {
+                return new DownloadResult(MediaType::CAROUSEL, $downloaded, $tempDir);
+            }
+        }
+
+        // Если это видео без водяного знака
+        $videoUrl = $data['video']['noWatermark'] 
+            ?? $data['video']['watermark'] 
+            ?? ($data['video']['url'] ?? null);
+
+        if ($videoUrl) {
+            $videoPath = "{$tempDir}/video.mp4";
+            $fp = fopen($videoPath, 'w+');
+            
+            $ch = curl_init($videoUrl);
+            curl_setopt_array($ch, [
+                CURLOPT_FILE           => $fp,
+                CURLOPT_TIMEOUT        => 20,
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_USERAGENT      => 'com.zhiliaoapp.musically/2022600030 (Linux; U; Android 12; en_US; Pixel 6)',
+            ]);
+            curl_exec($ch);
+            curl_close($ch);
+            fclose($fp);
+
+            if (file_exists($videoPath) && filesize($videoPath) > 50000) {
+                return new DownloadResult(MediaType::VIDEO, [$videoPath], $tempDir);
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Если yt-dlp всё-таки отдал HEVC (hvc1), ffmpeg быстро перегоняет его в h264
+     */
+    private function ensureH264Compatible(string $videoPath, string $tempDir): string
+    {
+        // Проверяем кодек через ffprobe
+        $codec = trim((string)shell_exec(sprintf(
+            'ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 %s',
+            escapeshellarg($videoPath)
+        )));
+
+        // Если это уже h264 — отдаем как есть
+        if ($codec === 'h264') {
+            return $videoPath;
+        }
+
+        // Если это hevc/h265 — пережимаем с ultrafast пресетом (займет 3-4 секунды)
+        $outPath = "{$tempDir}/fixed_video.mp4";
+        $cmd = sprintf(
+            'ffmpeg -y -i %s -c:v libx264 -preset ultrafast -crf 26 -c:a copy %s 2>&1',
+            escapeshellarg($videoPath),
+            escapeshellarg($outPath)
+        );
+        exec($cmd);
+
+        return (file_exists($outPath) && filesize($outPath) > 50000) ? $outPath : $videoPath;
     }
 
     /**
