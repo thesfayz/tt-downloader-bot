@@ -16,7 +16,6 @@ final class YtDlpDownloader implements MediaDownloaderInterface
         private readonly int $socketTimeout = 30,
         ?string $downloadDir = null
     ) {
-        // Используем папку из Dockerfile, если она есть, иначе системный tmp
         $this->downloadDir = $downloadDir ?: (is_dir('/app/downloads') ? '/app/downloads' : sys_get_temp_dir());
     }
 
@@ -28,17 +27,26 @@ final class YtDlpDownloader implements MediaDownloaderInterface
             return null;
         }
 
-        error_log("[DOWNLOADER] Начинаем загрузку: $url в $tempDir");
+        error_log("[DOWNLOADER] Начинаем загрузку: $url");
 
-        // 1. Пробуем внешние API (быстро, без нагрузки на CPU)
-        $apiResult = $this->tryExternalApis($url, $tempDir);
-        if ($apiResult !== null) {
-            return $apiResult;
+        // 1. Cobalt API (работает стабильно, не блокирует IP)
+        $cobaltResult = $this->tryCobalt($url, $tempDir);
+        if ($cobaltResult !== null) {
+            error_log("[DOWNLOADER] Успех через Cobalt");
+            return $cobaltResult;
         }
 
-        // 2. Фоллбэк на yt-dlp с форсом мобильного API и склейкой через ffmpeg
+        // 2. TikWM (на случай если разбанят)
+        $tikwmResult = $this->tryTikWm($url, $tempDir);
+        if ($tikwmResult !== null) {
+            error_log("[DOWNLOADER] Успех через TikWM");
+            return $tikwmResult;
+        }
+
+        // 3. yt-dlp (последний шанс)
         $ytResult = $this->tryYtDlp($url, $tempDir);
         if ($ytResult !== null) {
+            error_log("[DOWNLOADER] Успех через yt-dlp");
             return $ytResult;
         }
 
@@ -47,104 +55,83 @@ final class YtDlpDownloader implements MediaDownloaderInterface
         return null;
     }
 
-    private function tryExternalApis(string $url, string $tempDir): ?DownloadResult
+    private function tryCobalt(string $url, string $tempDir): ?DownloadResult
     {
-        $apis = [
-            'TikWM' => fn() => $this->tryTikWm($url, $tempDir),
-            'SnapTik' => fn() => $this->trySnapTik($url, $tempDir),
-        ];
+        error_log("[Cobalt] Пробуем загрузку...");
 
-        foreach ($apis as $name => $fn) {
-            error_log("[API:$name] Пробуем...");
-            $result = $fn();
-            if ($result !== null) {
-                error_log("[API:$name] УСПЕХ");
-                return $result;
-            }
-        }
-        return null;
-    }
+        $ch = curl_init('https://api.cobalt.tools/');
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => json_encode([
+                'url' => $url,
+                'downloadMode' => 'auto',
+                'videoQuality' => '720',
+                'filenameStyle' => 'basic',
+            ]),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 30,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/json',
+                'Accept: application/json',
+                'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            ],
+        ]);
 
-    private function tryYtDlp(string $url, string $tempDir): ?DownloadResult
-    {
-        // Проверяем наличие yt-dlp и ffmpeg
-        exec('which yt-dlp 2>&1', $ytOut, $ytCode);
-        exec('which ffmpeg 2>&1', $ffOut, $ffCode);
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
 
-        if ($ytCode !== 0) {
-            error_log("[YT-DLP] НЕ НАЙДЕН в системе");
+        if ($httpCode !== 200 || !$response) {
+            error_log("[Cobalt] HTTP ошибка: $httpCode");
             return null;
         }
-        if ($ffCode !== 0) {
-            error_log("[YT-DLP] ffmpeg НЕ НАЙДЕН (нужен для склейки видео)");
+
+        $data = json_decode((string)$response, true);
+        if (!is_array($data)) {
+            error_log("[Cobalt] Не JSON ответ");
+            return null;
         }
 
+        // Проверяем статус
+        $status = $data['status'] ?? 'error';
+        if ($status !== 'stream' && $status !== 'redirect' && $status !== 'tunnel') {
+            error_log("[Cobalt] Статус: $status, сообщение: " . ($data['text'] ?? 'unknown'));
+            return null;
+        }
+
+        // Получаем ссылку на видео
+        $videoUrl = $data['url'] ?? null;
+        if (!$videoUrl) {
+            error_log("[Cobalt] Не найдена ссылка на видео");
+            return null;
+        }
+
+        error_log("[Cobalt] Получена ссылка: " . substr($videoUrl, 0, 80));
+
+        // Скачиваем видео
         $videoPath = "{$tempDir}/video.mp4";
-
-        // КРИТИЧЕСКИ ВАЖНЫЕ аргументы для обхода блокировок Render и корректной склейки
-        $cmd = sprintf(
-            'yt-dlp --no-warnings --no-playlist --socket-timeout %d ' .
-            '--extractor-args "tiktok:api_hostname=api16-normal-c-useast1a.tiktokv.com" ' .
-            '--extractor-args "tiktok:api_version=19.4.0" ' .
-            '-f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" ' .
-            '--merge-output-format mp4 ' .
-            '--ffmpeg-location /usr/bin/ffmpeg ' . // Явно указываем путь из Alpine
-            '--no-part ' .
-            '--user-agent "com.zhiliaoapp.musically/2023405030 (Linux; U; Android 11; en_US; Pixel 4)" ' .
-            '-o %s %s 2>&1',
-            $this->socketTimeout,
-            escapeshellarg($videoPath),
-            escapeshellarg($url)
-        );
-        
-        error_log("[YT-DLP] Запуск команды...");
-        
-        $output = [];
-        $resultCode = 0;
-        exec($cmd, $output, $resultCode);
-
-        $lastLines = implode(' | ', array_slice($output, -5));
-        error_log("[YT-DLP] Код возврата: $resultCode. Вывод: $lastLines");
-
-        if ($resultCode !== 0) {
-            error_log("[YT-DLP] Ошибка выполнения yt-dlp");
-            return null;
+        if ($this->streamToFile($videoUrl, $videoPath)) {
+            return new DownloadResult(MediaType::VIDEO, [$videoPath], $tempDir);
         }
 
-        if (!file_exists($videoPath)) {
-            error_log("[YT-DLP] Файл не был создан по пути: $videoPath");
-            return null;
-        }
-
-        $size = filesize($videoPath);
-        error_log("[YT-DLP] Файл создан, размер: $size байт");
-
-        if ($size < 10000) {
-            error_log("[YT-DLP] Файл слишком мал ($size байт), вероятно, это не видео");
-            @unlink($videoPath);
-            return null;
-        }
-
-        if (!$this->isValidVideo($videoPath)) {
-            error_log("[YT-DLP] Файл не прошел валидацию сигнатуры MP4");
-            @unlink($videoPath);
-            return null;
-        }
-
-        return new DownloadResult(MediaType::VIDEO, [$videoPath], $tempDir);
+        return null;
     }
 
     private function tryTikWm(string $url, string $tempDir): ?DownloadResult
     {
+        error_log("[TikWM] Пробуем...");
+
         $ch = curl_init('https://www.tikwm.com/api/');
         curl_setopt_array($ch, [
-            CURLOPT_POST           => true,
-            CURLOPT_POSTFIELDS     => http_build_query(['url' => $url, 'count' => 12, 'cursor' => 0, 'web' => 1, 'hd' => 1]),
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => http_build_query(['url' => $url, 'count' => 12, 'cursor' => 0, 'web' => 1, 'hd' => 1]),
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT        => 15,
+            CURLOPT_TIMEOUT => 15,
             CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_HTTPHEADER     => [
+            CURLOPT_HTTPHEADER => [
                 'Accept: application/json',
                 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 'Referer: https://www.tikwm.com/',
@@ -154,10 +141,14 @@ final class YtDlpDownloader implements MediaDownloaderInterface
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
 
-        if ($httpCode !== 200 || !$response) return null;
+        if ($httpCode !== 200 || !$response) {
+            error_log("[TikWM] HTTP $httpCode");
+            return null;
+        }
 
         $data = json_decode((string)$response, true);
         if (!is_array($data) || ($data['code'] ?? -1) !== 0 || empty($data['data'])) {
+            error_log("[TikWM] API error");
             return null;
         }
 
@@ -177,32 +168,54 @@ final class YtDlpDownloader implements MediaDownloaderInterface
         return null;
     }
 
-    private function trySnapTik(string $url, string $tempDir): ?DownloadResult
+    private function tryYtDlp(string $url, string $tempDir): ?DownloadResult
     {
-        $ch = curl_init('https://snaptik.app/abc2');
-        curl_setopt_array($ch, [
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => http_build_query(['url' => $url]),
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 15,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-        ]);
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
+        error_log("[YT-DLP] Пробуем...");
 
-        if ($httpCode !== 200 || !$response) return null;
-
-        if (preg_match('/href="(https:\/\/[^"]*tikwm[^"]*\.mp4[^"]*)"/i', $response, $m) ||
-            preg_match('/href="(https:\/\/[^"]*snaptik[^"]*\.mp4[^"]*)"/i', $response, $m)) {
-            $videoPath = "{$tempDir}/video.mp4";
-            if ($this->streamToFile(html_entity_decode($m[1]), $videoPath)) {
-                return new DownloadResult(MediaType::VIDEO, [$videoPath], $tempDir);
-            }
+        exec('which yt-dlp 2>&1', $ytOut, $ytCode);
+        if ($ytCode !== 0) {
+            error_log("[YT-DLP] НЕ НАЙДЕН");
+            return null;
         }
-        return null;
+
+        $videoPath = "{$tempDir}/video.mp4";
+
+        $cmd = sprintf(
+            'yt-dlp --no-warnings --no-playlist --socket-timeout %d ' .
+            '--extractor-args "tiktok:api_hostname=api16-normal-c-useast1a.tiktokv.com" ' .
+            '--extractor-args "tiktok:api_version=19.4.0" ' .
+            '-f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" ' .
+            '--merge-output-format mp4 ' .
+            '--no-part ' .
+            '--user-agent "com.zhiliaoapp.musically/2023405030 (Linux; U; Android 11; en_US; Pixel 4)" ' .
+            '-o %s %s 2>&1',
+            $this->socketTimeout,
+            escapeshellarg($videoPath),
+            escapeshellarg($url)
+        );
+
+        $output = [];
+        $resultCode = 0;
+        exec($cmd, $output, $resultCode);
+
+        $lastLines = implode(' | ', array_slice($output, -5));
+        error_log("[YT-DLP] Код: $resultCode. Вывод: $lastLines");
+
+        if ($resultCode !== 0) {
+            return null;
+        }
+
+        if (!file_exists($videoPath) || filesize($videoPath) < 10000) {
+            @unlink($videoPath);
+            return null;
+        }
+
+        if (!$this->isValidVideo($videoPath)) {
+            @unlink($videoPath);
+            return null;
+        }
+
+        return new DownloadResult(MediaType::VIDEO, [$videoPath], $tempDir);
     }
 
     private function streamToFile(string $url, string $destPath): bool
@@ -213,12 +226,12 @@ final class YtDlpDownloader implements MediaDownloaderInterface
         $ch = curl_init($url);
         curl_setopt_array($ch, [
             CURLOPT_FILE => $fp,
-            CURLOPT_TIMEOUT => 45,
+            CURLOPT_TIMEOUT => 60,
             CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_SSL_VERIFYPEER => false,
             CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         ]);
-        
+
         curl_exec($ch);
         $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $contentType = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
@@ -242,14 +255,12 @@ final class YtDlpDownloader implements MediaDownloaderInterface
     {
         $fp = fopen($filePath, 'rb');
         if (!$fp) return false;
-        
+
         $header = fread($fp, 32);
         fclose($fp);
 
-        // Проверяем сигнатуру MP4 (ftyp), но исключаем M4A (чистый аудио)
         if (strpos($header, 'ftyp') !== false) {
             if (strpos($header, 'M4A') !== false || strpos($header, 'M4B') !== false) {
-                error_log("[VALIDATE] Это аудио-контейнер M4A, а не видео!");
                 return false;
             }
             return true;
@@ -259,7 +270,6 @@ final class YtDlpDownloader implements MediaDownloaderInterface
             return true;
         }
 
-        error_log("[VALIDATE] Неверная сигнатура файла: " . bin2hex(substr($header, 0, 16)));
         return false;
     }
 }
