@@ -17,29 +17,17 @@ final class UpdateDispatcher
 
     public function dispatch(array $update): void
     {
-        // Поддерживаем и обычные сообщения, и редактированные (edited_message)
-        $message = $update['message'] ?? $update['edited_message'] ?? null;
-
-        if (!is_array($message) || !isset($message['text'])) {
+        if (!isset($update['message']['text'])) {
             return;
         }
 
-        $chatId = (int)($message['chat']['id'] ?? 0);
-        if ($chatId === 0) {
-            return;
-        }
-
-        $text = trim((string)$message['text']);
+        $chatId = (int)$update['message']['chat']['id'];
+        $text = trim($update['message']['text']);
 
         foreach ($this->handlers as $handler) {
-            try {
-                if ($handler->supports($text)) {
-                    $handler->handle($chatId, $text);
-                    return;
-                }
-            } catch (\Throwable $e) {
-                echo '[Dispatcher] Ошибка обработчика ' . get_class($handler)
-                    . ': ' . $e->getMessage() . "\n";
+            if ($handler->supports($text)) {
+                $handler->handle($chatId, $text);
+                return;
             }
         }
     }
