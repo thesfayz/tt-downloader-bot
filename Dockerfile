@@ -3,8 +3,8 @@ FROM php:8.2-cli-alpine
 # Устанавливаем зависимости
 RUN apk add --no-cache git unzip curl python3 py3-pip ffmpeg
 
-# Создаем симлинк python -> python3 (yt-dlp ищет именно python)
-RUN ln -s /usr/bin/python3 /usr/bin/python
+# Принудительно создаем симлинк python -> python3 (перезаписываем если есть)
+RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 # Устанавливаем yt-dlp
 RUN pip install --no-cache-dir yt-dlp
