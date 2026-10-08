@@ -84,7 +84,7 @@ final class YtDlpDownloader implements MediaDownloaderInterface
         curl_close($ch);
 
         if ($httpCode !== 200 || !$response) {
-            error_log("[Cobalt] HTTP ошибка: $httpCode");
+            error_log("[Cobalt] HTTP ошибка: $httpCode, ответ: " . substr((string)$response, 0, 300));
             return null;
         }
 
