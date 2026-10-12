@@ -6,8 +6,8 @@ require __DIR__ . '/vendor/autoload.php';
 
 use App\BotRunner;
 use App\Dispatcher\UpdateDispatcher;
+use App\Handlers\MediaDownloadHandler;
 use App\Handlers\StartCommandHandler;
-use App\Handlers\TikTokDownloadHandler;
 use App\Services\Downloaders\GenericYtDlpDownloader;
 use App\Services\Downloaders\TikTokDownloader;
 use App\Services\MediaDownloaderManager;
@@ -35,23 +35,23 @@ $httpClient = new Client(['timeout' => 30.0, 'verify' => false]);
 $receiver = new TelegramReceiver($httpClient, $botToken);
 $sender   = new TelegramSender($httpClient, $botToken);
 
-// Сервисы TikTok
-$urlResolver = new CanonicalTikTokUrlResolver(
+// Специфичный для TikTok резолвер передается сразу внутрь TikTokDownloader
+$tikTokUrlResolver = new CanonicalTikTokUrlResolver(
     redirectResolver: new RedirectResolver($httpClient),
     idExtractor:      new TikTokIdExtractor(),
     sanitizer:        new TikTokUrlSanitizer()
 );
 
-// Менеджер загрузчиков со стратегиями
+// Менеджер загрузчиков
 $downloader = new MediaDownloaderManager([
-    new TikTokDownloader(socketTimeout: 20),
+    new TikTokDownloader(urlResolver: $tikTokUrlResolver, socketTimeout: 20),
     new GenericYtDlpDownloader(socketTimeout: 20),
 ]);
 
-// Диспетчер команд
+// Диспетчер команд: теперь хэндлер принимает ЛЮБЫЕ ссылки
 $dispatcher = new UpdateDispatcher([
     new StartCommandHandler($sender),
-    new TikTokDownloadHandler($sender, $urlResolver, $downloader),
+    new MediaDownloadHandler($sender, $downloader),
 ]);
 
 // Запуск
