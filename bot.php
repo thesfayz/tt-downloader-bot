@@ -8,13 +8,15 @@ use App\BotRunner;
 use App\Dispatcher\UpdateDispatcher;
 use App\Handlers\StartCommandHandler;
 use App\Handlers\TikTokDownloadHandler;
+use App\Services\Downloaders\GenericYtDlpDownloader;
+use App\Services\Downloaders\TikTokDownloader;
+use App\Services\MediaDownloaderManager;
 use App\Services\Telegram\TelegramReceiver;
 use App\Services\Telegram\TelegramSender;
 use App\Services\Url\CanonicalTikTokUrlResolver;
 use App\Services\Url\RedirectResolver;
 use App\Services\Url\TikTokIdExtractor;
 use App\Services\Url\TikTokUrlSanitizer;
-use App\Services\YtDlpDownloader;
 use Dotenv\Dotenv;
 use GuzzleHttp\Client;
 
@@ -39,7 +41,12 @@ $urlResolver = new CanonicalTikTokUrlResolver(
     idExtractor:      new TikTokIdExtractor(),
     sanitizer:        new TikTokUrlSanitizer()
 );
-$downloader = new YtDlpDownloader(socketTimeout: 20);
+
+// Менеджер загрузчиков со стратегиями
+$downloader = new MediaDownloaderManager([
+    new TikTokDownloader(socketTimeout: 20),
+    new GenericYtDlpDownloader(socketTimeout: 20),
+]);
 
 // Диспетчер команд
 $dispatcher = new UpdateDispatcher([
