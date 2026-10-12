@@ -22,7 +22,7 @@ final class StartCommandHandler implements HandlerInterface
     {
         $this->sender->sendMessage(
             $chatId,
-            "Привет! Отправь ссылку на TikTok, и я пришлю файлы без водяного знака."
+            "Привет! Отправь ссылку, и я пришлю файлы без водяного знака."
         );
     }
 }
