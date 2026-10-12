@@ -1,0 +1,70 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Handlers;
+
+use App\Contracts\HandlerInterface;
+use App\Contracts\MediaDownloaderInterface;
+use App\Contracts\MessageSenderInterface;
+use App\DTO\MediaType;
+
+final class MediaDownloadHandler implements HandlerInterface
+{
+    public function __construct(
+        private readonly MessageSenderInterface $sender,
+        private readonly MediaDownloaderInterface $downloader
+    ) {}
+
+    public function supports(string $text): bool
+    {
+        return (bool) preg_match('/https?:\/\/[^\s]+/', $text);
+    }
+
+    public function handle(int $chatId, string $text): void
+    {
+        preg_match('/https?:\/\/[^\s]+/', $text, $matches);
+        $rawUrl = $matches[0];
+
+        $this->sender->sendMessage($chatId, "Загружаю, подожди пару секунд...");
+        echo "Запрос на загрузку URL: {$rawUrl}\n";
+
+        // Менеджер сам найдет подходящую стратегию (TikTok, Twitter, etc.)
+        $result = $this->downloader->download($rawUrl);
+
+        if ($result === null) {
+            $this->sender->sendMessage($chatId, "Не удалось загрузить медиа по этой ссылке.");
+            return;
+        }
+
+        try {
+            if ($result->type === MediaType::CAROUSEL) {
+                $count = count($result->filePaths);
+                echo "Найдено слайдов для отправки: {$count}\n";
+
+                if ($count === 0) {
+                    $this->sender->sendMessage($chatId, "Не удалось извлечь фото из карусели.");
+                    return;
+                }
+
+                if ($count === 1) {
+                    echo "Отправка одиночного фото...\n";
+                    $this->sender->sendPhoto($chatId, $result->filePaths[0], 'Скачано через @sfayzttbot');
+                } else {
+                    echo "Отправка медиагруппы ({$count} фото)...\n";
+                    $this->sender->sendMediaGroup($chatId, $result->filePaths, 'Скачано через @sfayzttbot');
+                }
+
+                echo "Карусель ({$count} фото) доставлена.\n";
+            } elseif ($result->type === MediaType::VIDEO) {
+                $this->sender->sendVideo($chatId, $result->filePaths[0], 'Скачано через @sfayzttbot');
+                echo "Видео доставлено.\n";
+            }
+        } catch (\Throwable $e) {
+            echo "Ошибка отправки: " . $e->getMessage() . "\n";
+            $this->sender->sendMessage($chatId, "Произошла ошибка при отправке файла в чат.");
+        } finally {
+            $result->cleanup();
+        }
+    }
+}
