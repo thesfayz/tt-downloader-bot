@@ -11,7 +11,6 @@ use App\DTO\MediaType;
 final class YtDlpDownloader implements MediaDownloaderInterface
 {
     public function __construct(
-        private readonly VideoTranscoder $transcoder = new VideoTranscoder(),
         private readonly int $socketTimeout = 30
     ) {}
 
@@ -22,29 +21,28 @@ final class YtDlpDownloader implements MediaDownloaderInterface
             return null;
         }
 
-        // 1. Проверяем карусель фоток через разбор данных страницы
+        // 1. Проверяем карусель фоток через стейт страницы
         $images = $this->extractImagesFromHtml($url, $tempDir);
         if (!empty($images)) {
             return new DownloadResult(MediaType::CAROUSEL, $images, $tempDir);
         }
 
-        // 2. Скачивание видео через стабильный yt-dlp (без внешних API)
+        // 2. Скачивание видео: принудительно забираем нативный H.264 до 720p
+        // -S "vcodec:h264,res:720" заставляет TikTok отдать легкий, не лагающий поток
         $videoPath = "{$tempDir}/video.mp4";
         $videoCmd = sprintf(
-            'yt-dlp --no-warnings --socket-timeout %d -f "bv*+ba/b" --merge-output-format mp4 --no-part -o %s %s 2>&1',
+            'yt-dlp --no-warnings --socket-timeout %d -S "vcodec:h264,res:720" -f "b/bv*+ba" --merge-output-format mp4 --no-part -o %s %s 2>&1',
             $this->socketTimeout,
             escapeshellarg($videoPath),
             escapeshellarg($url)
         );
         exec($videoCmd);
 
-        // 3. Если скачалось — отдаем транскодеру для проверки и фикса HEVC
         if (file_exists($videoPath) && filesize($videoPath) > 50000) {
-            $videoPath = $this->transcoder->ensureH264($videoPath);
             return new DownloadResult(MediaType::VIDEO, [$videoPath], $tempDir);
         }
 
-        // 4. Дополнительная проверка на карусель, если был редирект короткой ссылки
+        // 3. Запасная проверка на карусель при редиректе коротких ссылок
         $jsonCmd = sprintf(
             'yt-dlp -J --no-warnings --socket-timeout %d %s 2>&1',
             $this->socketTimeout,
