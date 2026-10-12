@@ -5,12 +5,14 @@ declare(strict_types=1);
 namespace App\Services\Downloaders;
 
 use App\Contracts\PlatformDownloaderInterface;
+use App\Contracts\UrlResolverInterface;
 use App\DTO\DownloadResult;
 use App\DTO\MediaType;
 
 final class TikTokDownloader implements PlatformDownloaderInterface
 {
     public function __construct(
+        private readonly ?UrlResolverInterface $urlResolver = null,
         private readonly int $socketTimeout = 30
     ) {}
 
@@ -22,13 +24,16 @@ final class TikTokDownloader implements PlatformDownloaderInterface
 
     public function download(string $url): ?DownloadResult
     {
+        // Резолвим короткие ссылки и чистим метки TikTok внутри его собственной стратегии
+        $targetUrl = $this->urlResolver !== null ? $this->urlResolver->resolve($url) : $url;
+
         $tempDir = sys_get_temp_dir() . '/' . uniqid('tt_dl_', true);
         if (!@mkdir($tempDir, 0777, true)) {
             return null;
         }
 
         // 1. Проверяем карусель фоток
-        $images = $this->extractImagesFromHtml($url, $tempDir);
+        $images = $this->extractImagesFromHtml($targetUrl, $tempDir);
         if (!empty($images)) {
             return new DownloadResult(MediaType::CAROUSEL, $images, $tempDir);
         }
@@ -39,7 +44,7 @@ final class TikTokDownloader implements PlatformDownloaderInterface
             'yt-dlp --no-warnings --socket-timeout %d -S "vcodec:h264,res:720" -f "b/bv*+ba" --merge-output-format mp4 --no-part -o %s %s 2>&1',
             $this->socketTimeout,
             escapeshellarg($videoPath),
-            escapeshellarg($url)
+            escapeshellarg($targetUrl)
         );
         exec($videoCmd);
 
@@ -47,17 +52,17 @@ final class TikTokDownloader implements PlatformDownloaderInterface
             return new DownloadResult(MediaType::VIDEO, [$videoPath], $tempDir);
         }
 
-        // 3. Запасная проверка на карусель после редиректа
+        // 3. Запасная проверка на карусель после редиректа через yt-dlp
         $jsonCmd = sprintf(
             'yt-dlp -J --no-warnings --socket-timeout %d %s 2>&1',
             $this->socketTimeout,
-            escapeshellarg($url)
+            escapeshellarg($targetUrl)
         );
         $rawJson = shell_exec($jsonCmd);
         $meta = json_decode((string)$rawJson, true);
 
         $webpageUrl = $meta['webpage_url'] ?? null;
-        if ($webpageUrl && $webpageUrl !== $url) {
+        if ($webpageUrl && $webpageUrl !== $targetUrl) {
             $images = $this->extractImagesFromHtml($webpageUrl, $tempDir);
             if (!empty($images)) {
                 return new DownloadResult(MediaType::CAROUSEL, $images, $tempDir);
